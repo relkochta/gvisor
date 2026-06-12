@@ -199,6 +199,11 @@ func (*hostnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
+// GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
+func (*hostnameData) GetDynamicBytesPoller(ctx context.Context) *vfs.DynamicBytesPoller {
+	return &kernel.KernelFromContext(ctx).HostNamePoller
+}
+
 // domainnameData implements vfs.DynamicBytesSource for /proc/sys/kernel/domainname.
 //
 // +stateify savable
@@ -215,6 +220,11 @@ func (*domainnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString(utsns.DomainName())
 	buf.WriteString("\n")
 	return nil
+}
+
+// GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
+func (*domainnameData) GetDynamicBytesPoller(ctx context.Context) *vfs.DynamicBytesPoller {
+	return &kernel.KernelFromContext(ctx).DomainNamePoller
 }
 
 // tcpSackData implements vfs.WritableDynamicBytesSource for
