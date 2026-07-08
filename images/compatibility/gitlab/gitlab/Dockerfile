@@ -1,0 +1,1 @@
+FROM gitlab/gitlab-ce:19.1.1-ce.0

@@ -39,6 +39,8 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
+	units "github.com/docker/go-units"
+
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
@@ -105,6 +107,9 @@ type RunOpts struct {
 
 	// CapDrop are the extra set of capabilities to drop.
 	CapDrop []string
+
+	// Ulimits sets resource limits on the container.
+	Ulimits []*units.Ulimit
 
 	// Mounts is the list of directories/files to be mounted inside the container.
 	Mounts []mount.Mount
@@ -371,6 +376,7 @@ func (c *Container) hostConfig(r RunOpts) *container.HostConfig {
 			CpusetCpus:     r.CpusetCpus,
 			DeviceRequests: r.DeviceRequests,
 			Devices:        r.Devices,
+			Ulimits:        r.Ulimits,
 		},
 		Annotations: r.Annotations,
 	}

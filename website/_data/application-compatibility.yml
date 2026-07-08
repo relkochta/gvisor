@@ -1,0 +1,254 @@
+apps:
+  # ---- Databases & data stores ----
+  - name: "PostgreSQL"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "18.4"
+    test_source: "test/compatibility/postgresql/postgresql_test.go"
+
+  - name: "MySQL"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "9.7.1"
+    test_source: "test/image/image_test.go"
+
+  - name: "MariaDB"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "12.3.2"
+    test_source: "test/compatibility/mariadb/mariadb_test.go"
+
+  - name: "MongoDB"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "8.3.4"
+    test_source: "test/compatibility/mongodb/mongodb_test.go"
+
+  - name: "Redis"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "8.8.0"
+    test_source: "test/compatibility/redis/redis_test.go"
+
+  - name: "Valkey"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "9.0.4"
+    test_source: "test/compatibility/valkey/valkey_test.go"
+
+  - name: "Memcached"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "1.6.42"
+    test_source: "test/compatibility/memcached/memcached_test.go"
+
+  - name: "Cassandra"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "5.0.8"
+    test_source: "test/compatibility/cassandra/cassandra_test.go"
+
+  - name: "Elasticsearch"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "9.4.2"
+    test_source: "test/compatibility/elasticsearch/elasticsearch_test.go"
+
+  - name: "ClickHouse"
+    category: "Databases & data stores"
+    verdict: "yes"
+    version: "26.5.5.8"
+    notes: "Requires the config flag skip_binary_checksum_checks=true to bypass ClickHouse's executable self-integrity check."
+    test_source: "test/compatibility/clickhouse/clickhouse_test.go"
+
+  # ---- Messaging & streaming ----
+  - name: "RabbitMQ"
+    category: "Messaging & streaming"
+    verdict: "yes"
+    version: "4.3.2"
+    test_source: "test/compatibility/rabbitmq/rabbitmq_test.go"
+
+  - name: "Apache Kafka"
+    category: "Messaging & streaming"
+    verdict: "yes"
+    version: "4.3.1"
+    test_source: "test/compatibility/kafka/kafka_test.go"
+
+  - name: "Eclipse Mosquitto"
+    category: "Messaging & streaming"
+    verdict: "yes"
+    version: "2.0.22"
+    test_source: "test/compatibility/mosquitto/mosquitto_test.go"
+
+  # ---- Web servers, proxies & gateways ----
+  - name: "NGINX"
+    category: "Web servers, proxies & gateways"
+    verdict: "yes"
+    version: "1.31.2"
+    test_source: "test/image/image_test.go"
+
+  - name: "Apache HTTP Server"
+    category: "Web servers, proxies & gateways"
+    verdict: "yes"
+    version: "2.4.68"
+    test_source: "test/image/image_test.go"
+
+  - name: "Caddy"
+    category: "Web servers, proxies & gateways"
+    verdict: "yes"
+    version: "2.11.4"
+    test_source: "test/compatibility/caddy/caddy_test.go"
+
+  - name: "HAProxy"
+    category: "Web servers, proxies & gateways"
+    verdict: "yes"
+    version: "3.4.1"
+    test_source: "test/compatibility/haproxy/haproxy_test.go"
+
+  - name: "Traefik"
+    category: "Web servers, proxies & gateways"
+    verdict: "yes"
+    version: "3.7.6"
+    test_source: "test/compatibility/traefik/traefik_test.go"
+
+  - name: "Envoy"
+    category: "Web servers, proxies & gateways"
+    verdict: "yes"
+    version: "1.38.3"
+    test_source: "test/compatibility/envoy/envoy_test.go"
+
+  # ---- Observability & monitoring ----
+  - name: "Prometheus"
+    category: "Observability & monitoring"
+    verdict: "yes"
+    version: "3.13.0"
+    test_source: "test/compatibility/prometheus/prometheus_test.go"
+
+  - name: "Grafana"
+    category: "Observability & monitoring"
+    verdict: "yes"
+    version: "13.0.3"
+    test_source: "test/compatibility/grafana/grafana_test.go"
+
+  - name: "Vector"
+    category: "Observability & monitoring"
+    verdict: "yes"
+    version: "0.56.0"
+    test_source: "test/compatibility/vector/vector_test.go"
+
+  - name: "Fluent Bit"
+    category: "Observability & monitoring"
+    verdict: "yes"
+    version: "5.0.8"
+    test_source: "test/compatibility/fluent-bit/fluentbit_test.go"
+
+  - name: "Datadog Agent"
+    category: "Observability & monitoring"
+    verdict: "partial"
+    version: "7.80.3"
+    notes: "Some host checks (particularly I/O related) are not available."
+
+  # ---- CI/CD & developer tooling ----
+  - name: "Jenkins"
+    category: "CI/CD & developer tooling"
+    verdict: "yes"
+    version: "2.571"
+    test_source: "test/compatibility/jenkins/jenkins_test.go"
+
+  - name: "GitLab"
+    category: "CI/CD & developer tooling"
+    verdict: "partial"
+    version: "19.1.1"
+    notes: "The GitLab web application and CI runner are functional. The integrated ssh daemon is unavailable."
+    test_source: "test/compatibility/gitlab/gitlab_test.go"
+
+  - name: "Gitea"
+    category: "CI/CD & developer tooling"
+    verdict: "yes"
+    version: "1.26.2"
+    test_source: "test/compatibility/gitea/gitea_test.go"
+
+  - name: "Portainer"
+    category: "CI/CD & developer tooling"
+    verdict: "yes"
+    version: "2.39.4"
+    test_source: "test/compatibility/portainer/portainer_test.go"
+
+  - name: "Docker-in-Docker"
+    category: "CI/CD & developer tooling"
+    verdict: "partial"
+    version: "29.6.1"
+    notes: "Supported with caveats; see [Docker in gVisor](/docs/tutorials/docker-in-gvisor/)."
+
+  # ---- Storage & object stores ----
+  - name: "MinIO Community Edition"
+    category: "Storage & object stores"
+    verdict: "yes"
+    version: "RELEASE.2026-06-18"
+    notes: "Tested with community fork pgsty/minio."
+    test_source: "test/compatibility/minio/minio_test.go"
+
+  # ---- Secrets & security ----
+  - name: "HashiCorp Vault"
+    category: "Secrets & security"
+    verdict: "yes"
+    version: "2.0.3"
+    test_source: "test/compatibility/vault/vault_test.go"
+
+  - name: "Keycloak"
+    category: "Secrets & security"
+    verdict: "yes"
+    version: "26.6.4"
+    test_source: "test/compatibility/keycloak/keycloak_test.go"
+
+  # ---- Applications & platforms ----
+  - name: "WordPress"
+    category: "Applications & platforms"
+    verdict: "yes"
+    version: "7.0.0"
+    test_source: "test/compatibility/wordpress/wordpress_test.go"
+
+  - name: "Nextcloud"
+    category: "Applications & platforms"
+    verdict: "yes"
+    version: "34.0.0"
+    test_source: "test/compatibility/nextcloud/nextcloud_test.go"
+
+  - name: "n8n"
+    category: "Applications & platforms"
+    verdict: "yes"
+    version: "2.27.4"
+    test_source: "test/compatibility/n8n/n8n_test.go"
+
+  - name: "Home Assistant"
+    category: "Applications & platforms"
+    verdict: "yes"
+    version: "2026.6.4"
+    test_source: "test/compatibility/home-assistant/homeassistant_test.go"
+
+  - name: "Ollama"
+    category: "Applications & platforms"
+    verdict: "yes"
+    version: "0.31.1"
+    test_source: "test/compatibility/ollama/ollama_test.go"
+
+  - name: "OpenClaw"
+    category: "Applications & platforms"
+    verdict: "yes"
+    version: "2026.6.10"
+
+  # ---- System software ----
+  - name: "systemd"
+    category: "System software"
+    verdict: "coming-soon"
+
+  # ---- Infrastructure ----
+  - name: "Stakater Reloader"
+    category: "Infrastructure"
+    verdict: "yes"
+    version: "1.4.17"
+
+  - name: "Istio"
+    category: "Infrastructure"
+    verdict: "yes"
+    version: "1.28.8"

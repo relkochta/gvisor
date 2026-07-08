@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "properties": {
+    "apps": {
+      "description": "List of tested application compatibility entries.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/appEntry"
+      }
+    }
+  },
+  "required": [
+    "apps"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "appEntry": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The application name (one entry per application, not per Docker image).",
+          "type": "string"
+        },
+        "category": {
+          "description": "Grouping shown on the page.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "Compatibility verdict: yes (works), partial (works with a limitation/workaround), or coming-soon (testing not yet done).",
+          "type": "string",
+          "enum": [
+            "yes",
+            "partial",
+            "coming-soon"
+          ]
+        },
+        "version": {
+          "description": "The latest version tested.",
+          "type": "string"
+        },
+        "notes": {
+          "description": "Short, user-relevant note about behaviour under gVisor.",
+          "type": "string"
+        },
+        "test_source": {
+          "description": "Path, relative to the repository root, of the test that validates this entry. Rendered as a \"Testing methodology\" link to the file on GitHub.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "category",
+        "verdict"
+      ],
+      "allOf": [
+        {
+          "$comment": "Tested entries (yes/partial) must state the version tested.",
+          "if": {
+            "properties": {
+              "verdict": {
+                "enum": [
+                  "yes",
+                  "partial"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
+            ]
+          }
+        },
+        {
+          "$comment": "Partial entries must explain the limitation.",
+          "if": {
+            "properties": {
+              "verdict": {
+                "const": "partial"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "notes"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}
