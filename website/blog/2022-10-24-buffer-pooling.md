@@ -60,9 +60,9 @@ our `make()`s with `pool.Get()`s.
 
 Netstack uses a few different types of buffers under the hood. Some of these are
 specific to protocols, like
-[`segment`](https://github.com/google/gvisor/blob/master/pkg/tcpip/transport/tcp/segment.go)
+[`segment`](https://github.com/relkochta/gvisor/blob/master/pkg/tcpip/transport/tcp/segment.go)
 for TCP, and others are more widely shared, like
-[`PacketBuffer`](https://github.com/google/gvisor/blob/master/pkg/tcpip/stack/packet_buffer.go),
+[`PacketBuffer`](https://github.com/relkochta/gvisor/blob/master/pkg/tcpip/stack/packet_buffer.go),
 which is used for IP, ICMP, UDP, etc. Although each of these buffer types are
 slightly different, they generally share a few common traits that made it
 difficult to use `sync.Pool` out of the box:

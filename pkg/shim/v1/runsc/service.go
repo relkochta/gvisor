@@ -188,7 +188,18 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, err := NewContainer(ctx, s.platform, rfs.Create, rfs.Conf.ImagePath, rfs.Conf.Direct)
+	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
+		ID:                 rfs.Create.ID,
+		Bundle:             rfs.Create.Bundle,
+		Rootfs:             rfs.Create.Rootfs,
+		Options:            rfs.Create.Options,
+		Terminal:           rfs.Create.Terminal,
+		Stdin:              rfs.Create.Stdin,
+		Stdout:             rfs.Create.Stdout,
+		Stderr:             rfs.Create.Stderr,
+		FSRestoreImagePath: rfs.Conf.ImagePath,
+		FSRestoreDirect:    rfs.Conf.Direct,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +255,18 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 	p, err := c.Start(ctx, r)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
+	}
+	if len(r.ExecID) == 0 {
+		s.send(&events.TaskStart{
+			ContainerID: r.ID,
+			Pid:         uint32(p.Pid()),
+		})
+	} else {
+		s.send(&events.TaskExecStarted{
+			ContainerID: r.ID,
+			ExecID:      r.ExecID,
+			Pid:         uint32(p.Pid()),
+		})
 	}
 	// TODO: Set the cgroup and oom notifications on restore.
 	return &task.StartResponse{

@@ -41,11 +41,20 @@ func createDropAllTable(ipv6 bool, tabName string) error {
 	return ruleCmd("add", ruleArgs)
 }
 
-func nftCmd(args []string) error {
+func nftCmdOut(args []string) (string, error) {
 	binary := "nft"
 	cmd := exec.Command(binary, args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("error running nft with args %v\nerror: %v\noutput: %s", args, err, string(out))
+	o, err := cmd.CombinedOutput()
+	out := string(o)
+	if err != nil {
+		return out, fmt.Errorf("error running nft with args %v\nerror: %v\noutput: %s", args, err, out)
+	}
+	return out, err
+}
+
+func nftCmd(args []string) error {
+	if _, err := nftCmdOut(args); err != nil {
+		return err
 	}
 	return nil
 }
@@ -60,4 +69,12 @@ func chainCmd(cmd string, args []string) error {
 
 func ruleCmd(cmd string, args []string) error {
 	return nftCmd(append([]string{cmd, "rule"}, args...))
+}
+
+func runCmd(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("cmd %s %v failed: %v, output: %s", name, args, err, string(out))
+	}
+	return nil
 }

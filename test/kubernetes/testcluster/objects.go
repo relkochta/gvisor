@@ -139,6 +139,7 @@ func (n *Namespace) NewPod(name string) *v13.Pod {
 
 // GetPersistentVolume gets a persistent volume spec for benchmarks.
 func (n *Namespace) GetPersistentVolume(name, size string) *v13.PersistentVolumeClaim {
+	storageClass := "standard-rwo"
 	pvc := &v13.PersistentVolumeClaim{
 		TypeMeta: v1.TypeMeta{
 			Kind:       "PersistentVolumeClaim",
@@ -149,7 +150,8 @@ func (n *Namespace) GetPersistentVolume(name, size string) *v13.PersistentVolume
 			Namespace: n.Namespace,
 		},
 		Spec: v13.PersistentVolumeClaimSpec{
-			AccessModes: []v13.PersistentVolumeAccessMode{v13.ReadWriteOnce},
+			StorageClassName: &storageClass,
+			AccessModes:      []v13.PersistentVolumeAccessMode{v13.ReadWriteOnce},
 		},
 	}
 
@@ -218,6 +220,12 @@ func SetContainerResources(pod *v13.Pod, containerName string, requests Containe
 	}
 	if containerToChange == nil {
 		return nil, fmt.Errorf("container %q not found", containerName)
+	}
+	if containerToChange.Resources.Limits == nil {
+		containerToChange.Resources.Limits = make(v13.ResourceList)
+	}
+	if containerToChange.Resources.Requests == nil {
+		containerToChange.Resources.Requests = make(v13.ResourceList)
 	}
 	for _, resourceList := range []v13.ResourceList{
 		containerToChange.Resources.Limits,

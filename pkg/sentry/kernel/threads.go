@@ -322,6 +322,31 @@ func (ns *PIDNamespace) IDOfTask(t *Task) ThreadID {
 	return id
 }
 
+// IDsOfTasks returns the deduplicated TIDs assigned to the given tasks in PID namespace ns.
+// If a task is not visible in that namespace or is exiting, its TID is not included in the
+// returned map. If threadGroupIDs is true, the returned thread IDs correspond to the
+// thread groups of the given tasks.
+func (ns *PIDNamespace) IDsOfTasks(tasks []*Task, threadGroupIDs bool) map[ThreadID]struct{} {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+
+	idMap := make(map[ThreadID]struct{})
+	for _, task := range tasks {
+		if task.exitStateLocked() < TaskExitInitiated {
+			var id ThreadID
+			if threadGroupIDs {
+				id = ns.tgids[task.tg]
+			} else {
+				id = ns.tids[task]
+			}
+			if id != 0 {
+				idMap[id] = struct{}{}
+			}
+		}
+	}
+	return idMap
+}
+
 // IDOfThreadGroup returns the TID assigned to tg's leader in PID namespace ns.
 // If the task is not visible in that namespace, IDOfThreadGroup returns 0.
 func (ns *PIDNamespace) IDOfThreadGroup(tg *ThreadGroup) ThreadID {
@@ -329,6 +354,31 @@ func (ns *PIDNamespace) IDOfThreadGroup(tg *ThreadGroup) ThreadID {
 	id := ns.tgids[tg]
 	ns.owner.mu.RUnlock()
 	return id
+}
+
+// PIDNamespacedIDs returns a snapshot mapping each PID namespace in which tg's
+// leader is visible (tg's PID namespace and every ancestor) to tg's ID (PID)
+// in that namespace.
+//
+// The returned map is intended to be indexed by a PID namespace to which the
+// caller holds a reference. Because the returned map does not hold references
+// on its own, the other keys in the map *MUST NOT* be dereferenced.
+//
+// tg must be visible in its own PID namespace.
+func (tg *ThreadGroup) PIDNamespacedIDs() map[*PIDNamespace]ThreadID {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	ids := make(map[*PIDNamespace]ThreadID)
+	for ns := tg.pidns; ns != nil; ns = ns.parent {
+		id, ok := ns.tgids[tg]
+		if !ok {
+			// If tg is visible in its own pid ns, it must be visible in all ancestors
+			// as per the pid ns invariant.
+			panic("thread group not visible in its own or an ancestor PID namespace")
+		}
+		ids[ns] = id
+	}
+	return ids
 }
 
 // Tasks returns a snapshot of the tasks in ns.
@@ -516,11 +566,25 @@ func (tg *ThreadGroup) MemberIDs(pidns *PIDNamespace) []ThreadID {
 func (tg *ThreadGroup) ForEachTask(f func(t *Task) bool) {
 	tg.pidns.owner.mu.RLock()
 	defer tg.pidns.owner.mu.RUnlock()
+	tg.ForEachTaskLocked(f)
+}
+
+// ForEachTaskLocked invokes f() on each task in tg.
+//
+// Preconditions: The TaskSet mutex must be locked (for reading or writing).
+func (tg *ThreadGroup) ForEachTaskLocked(f func(t *Task) bool) {
 	for t := tg.tasks.Front(); t != nil; t = t.Next() {
 		if !f(t) {
 			break
 		}
 	}
+}
+
+// WithTaskSetRLock executes the given function f while holding the TaskSet's read lock.
+func (tg *ThreadGroup) WithTaskSetRLock(f func()) {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	f()
 }
 
 // ID returns tg's leader's thread ID in its own PID namespace.

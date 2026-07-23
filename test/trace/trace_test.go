@@ -39,7 +39,7 @@ type checkers struct {
 	count   int
 }
 
-// TestAll enabled all trace points in the system with all optional and context
+// TestAll enables all trace points in the system with all optional and context
 // fields enabled. Then it runs a workload that will trigger those points and
 // run some basic validation over the points generated.
 func TestAll(t *testing.T) {
@@ -106,6 +106,7 @@ func matchPoints(t *testing.T, msgs []test.Message) map[pb.MessageType]*checkers
 		pb.MessageType_MESSAGE_SENTRY_EXEC:               {checker: checkSentryExec},
 		pb.MessageType_MESSAGE_SENTRY_EXIT_NOTIFY_PARENT: {checker: checkSentryExitNotifyParent},
 		pb.MessageType_MESSAGE_SENTRY_TASK_EXIT:          {checker: checkSentryTaskExit},
+		pb.MessageType_MESSAGE_SENTRY_MMAP:               {checker: checkSentryMmap},
 		pb.MessageType_MESSAGE_SYSCALL_CLOSE:             {checker: checkSyscallClose},
 		pb.MessageType_MESSAGE_SYSCALL_CONNECT:           {checker: checkSyscallConnect},
 		pb.MessageType_MESSAGE_SYSCALL_EXECVE:            {checker: checkSyscallExecve},
@@ -133,6 +134,8 @@ func matchPoints(t *testing.T, msgs []test.Message) map[pb.MessageType]*checkers
 		pb.MessageType_MESSAGE_SYSCALL_INOTIFY_ADD_WATCH: {checker: checkSyscallInotifyInitAddWatch},
 		pb.MessageType_MESSAGE_SYSCALL_INOTIFY_RM_WATCH:  {checker: checkSyscallInotifyInitRmWatch},
 		pb.MessageType_MESSAGE_SYSCALL_CLONE:             {checker: checkSyscallClone},
+		pb.MessageType_MESSAGE_SYSCALL_MMAP:              {checker: checkSyscallMmap},
+		pb.MessageType_MESSAGE_SYSCALL_LISTEN:            {checker: checkSyscallListen},
 	}
 	return matchers
 }
@@ -233,7 +236,7 @@ func checkContainerStart(msg test.Message) error {
 		return fmt.Errorf("Getwd(): %v", err)
 	}
 	if cwd != p.Cwd {
-		return fmt.Errorf("invalid cwd, want: %q, got: %q", cwd, p.Cwd)
+		return fmt.Errorf("invalid cwd, got: %q, want: %q", p.Cwd, cwd)
 	}
 	if len(p.Args) == 0 {
 		return fmt.Errorf("empty args")
@@ -256,6 +259,24 @@ func checkSentryTaskExit(msg test.Message) error {
 	p := pb.TaskExit{}
 	if err := proto.Unmarshal(msg.Msg, &p); err != nil {
 		return err
+	}
+	if err := checkContextData(p.ContextData); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkSentryMmap(msg test.Message) error {
+	p := pb.MmapInfo{}
+	if err := proto.Unmarshal(msg.Msg, &p); err != nil {
+		return err
+	}
+	// Print out mmap events
+	if p.IsInitialMmap || p.MappedPath != "" {
+		fmt.Printf("Mmap event: path=%q, ino=%d, mode=%o, uid=%d, gid=%d, initial=%v\n", p.MappedPath, p.MappedIno, p.MappedMode, p.MappedUid, p.MappedGid, p.IsInitialMmap)
+	}
+	if p.MappedPath != "" && (p.MappedCtime == nil || (p.MappedCtime.Sec == 0 && p.MappedCtime.Nsec == 0)) {
+		return fmt.Errorf("MappedCtime should not be empty for mapped file: %q", p.MappedPath)
 	}
 	if err := checkContextData(p.ContextData); err != nil {
 		return err
@@ -294,6 +315,17 @@ func checkSyscallClose(msg test.Message) error {
 	return nil
 }
 
+func checkSyscallMmap(msg test.Message) error {
+	var p pb.Mmap
+	if err := proto.Unmarshal(msg.Msg, &p); err != nil {
+		return err
+	}
+	if err := checkContextData(p.ContextData); err != nil {
+		return err
+	}
+	return nil
+}
+
 func checkSyscallOpen(msg test.Message) error {
 	p := pb.Open{}
 	if err := proto.Unmarshal(msg.Msg, &p); err != nil {
@@ -320,13 +352,13 @@ func checkSyscallRead(msg test.Message) error {
 	if p.HasOffset {
 		// Workload always uses 20 for read offsets (account for partial reads).
 		if lower, upper := int64(20), int64(120); p.Offset < lower && p.Offset > upper {
-			return fmt.Errorf("invalid offset, want: [%d, %d], got: %d", lower, upper, p.Offset)
+			return fmt.Errorf("invalid offset, got: %d, want: [%d, %d]", p.Offset, lower, upper)
 		}
 	} else if p.Offset != 0 {
 		return fmt.Errorf("offset should be 0: %+v", &p)
 	}
 	if p.Flags != 0 && p.Flags != unix.RWF_HIPRI {
-		return fmt.Errorf("invalid flag value, want: 0 || RWF_HIPRI, got: %+x", p.Flags)
+		return fmt.Errorf("invalid flag value, got: %+x, want: 0 || RWF_HIPRI", p.Flags)
 	}
 	return nil
 }
@@ -346,13 +378,13 @@ func checkSyscallWrite(msg test.Message) error {
 	if p.HasOffset {
 		// Workload always uses 10 for write offsets (account for partial writes).
 		if lower, upper := int64(10), int64(110); p.Offset < lower && p.Offset > upper {
-			return fmt.Errorf("invalid offset, want: [%d, %d], got: %d", lower, upper, p.Offset)
+			return fmt.Errorf("invalid offset, got: %d, want: [%d, %d]", p.Offset, lower, upper)
 		}
 	} else if p.Offset != 0 {
 		return fmt.Errorf("offset should be 0: %+v", &p)
 	}
 	if p.Flags != 0 && p.Flags != unix.RWF_HIPRI {
-		return fmt.Errorf("invalid flag value, want: 0 || RWF_HIPRI, got: %+x", p.Flags)
+		return fmt.Errorf("invalid flag value, got: %+x, want: 0 || RWF_HIPRI", p.Flags)
 	}
 	return nil
 }
@@ -385,22 +417,42 @@ func checkSentryExec(msg test.Message) error {
 	if err := checkContextData(p.ContextData); err != nil {
 		return err
 	}
-	// As test runs locally the binary path may resolve to a symlink so would not be exactly same
-	// as the pathname passed.
+
 	if want := "/bin/true"; !strings.Contains(p.BinaryPath, want) {
-		return fmt.Errorf("wrong BinaryPath, want: %q, got: %q", want, p.BinaryPath)
+		return fmt.Errorf("wrong BinaryPath, got: %q, want substring: %q", p.BinaryPath, want)
 	}
 	if len(p.Argv) == 0 {
 		return fmt.Errorf("empty Argv")
 	}
-	if !strings.Contains(p.BinaryPath, p.Argv[0]) {
-		return fmt.Errorf("wrong Argv[0], want: %q, got: %q", p.BinaryPath, p.Argv[0])
+
+	// workload.cc fires two distinct ForkAndExec execution workloads:
+	// 1. A test checking execve syscall resolution using a symlink.
+	//    This uses "test_binary_name" as argv[0] mapping to a symlink at "/tmp/test_symlink".
+	// 2. A test covering execveat testing, which represents "/bin/true" relative to its path.
+	if p.Argv[0] == "test_binary_name" {
+		// In this case, we expect the following distinct path values:
+		// 1. BinaryPath: The fully resolved system path mapped by Sentry
+		//    (points to /bin/true).
+		// 2. Execfn: The exact invariant path string given by caller
+		//    (points to unresolved /tmp/test_symlink).
+		// 3. Argv[0]: The arbitrary caller-provided process argument
+		//    (points to synthetic "test_binary_name").
+		if want := "/tmp/test_symlink"; p.Execfn != want {
+			return fmt.Errorf("wrong Execfn, got: %q, want: %q", p.Execfn, want)
+		}
+		if p.BinaryPath == p.Execfn {
+			return fmt.Errorf("BinaryPath (%q) should differ from Execfn (%q)", p.BinaryPath, p.Execfn)
+		}
+	} else {
+		if !strings.Contains(p.BinaryPath, p.Argv[0]) {
+			return fmt.Errorf("wrong Argv[0], got: %q, want substring: %q", p.Argv[0], p.BinaryPath)
+		}
 	}
 	if len(p.Env) == 0 {
 		return fmt.Errorf("empty Env")
 	}
 	if want := "TEST=123"; want != p.Env[0] {
-		return fmt.Errorf("wrong Env[0], want: %q, got: %q", want, p.Env[0])
+		return fmt.Errorf("wrong Env[0], got: %q, want: %q", p.Env[0], want)
 	}
 	if (p.BinaryMode & 0111) == 0 {
 		return fmt.Errorf("executing non-executable file, mode: %#o (%#x)", p.BinaryMode, p.BinaryMode)
@@ -412,20 +464,33 @@ func checkSentryExec(msg test.Message) error {
 	if p.BinaryGid != nobody {
 		return fmt.Errorf("BinaryGid, want: %d, got: %d", nobody, p.BinaryGid)
 	}
+	if p.BinaryIno == 0 {
+		return fmt.Errorf("BinaryIno should not be 0")
+	}
+	if p.BinaryCtime == nil || (p.BinaryCtime.Sec == 0 && p.BinaryCtime.Nsec == 0) {
+		return fmt.Errorf("BinaryCtime should not be empty")
+	}
 
 	// Get SHA256 from the binary and compare it with the one from the event.
 	out, err := exec.Command("sha256sum", p.BinaryPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Not able to calculate sha256sum: %v", err)
+		return fmt.Errorf("Not able to calculate SHA256sum: %v", err)
 	}
-	want := strings.SplitN(string(out), " ", 2)[0]
+	want, _, _ := strings.Cut(string(out), " ")
 
 	got := ""
 	for _, b := range p.BinarySha256 {
 		got += fmt.Sprintf("%02x", b)
 	}
 	if want != got {
-		return fmt.Errorf("BinarySha256, want: %q, got: %q", got, want)
+		return fmt.Errorf("BinarySHA256, want: %q, got: %q", got, want)
+	}
+
+	if p.BinaryOverlayfsUpper {
+		return fmt.Errorf("BinaryOverlayfsUpper, want: false, got: true")
+	}
+	if !p.BinaryOverlayfsLower {
+		return fmt.Errorf("BinaryOverlayfsLower, want: true, got: false")
 	}
 
 	return nil
@@ -439,26 +504,40 @@ func checkSyscallExecve(msg test.Message) error {
 	if err := checkContextData(p.ContextData); err != nil {
 		return err
 	}
-	if p.Fd < 3 {
-		return fmt.Errorf("execve invalid FD: %d", p.Fd)
-	}
-	if want := "/"; want != p.FdPath {
-		return fmt.Errorf("wrong FdPath, want: %q, got: %q", want, p.FdPath)
-	}
-	if want := "/bin/true"; want != p.Pathname {
-		return fmt.Errorf("wrong Pathname, want: %q, got: %q", want, p.Pathname)
-	}
 	if len(p.Argv) == 0 {
 		return fmt.Errorf("empty Argv")
 	}
-	if p.Argv[0] != p.Pathname {
-		return fmt.Errorf("wrong Argv[0], want: %q, got: %q", p.Pathname, p.Argv[0])
+	// We handle two separate execs from workload.cc:
+	// 1. ForkAndExec, which tests execve relative to "/tmp/test_symlink" using "test_binary_name".
+	// 2. ForkAndExecveat, which tests execveat against "/bin/true" relative to its path.
+	if p.Argv[0] == "test_binary_name" {
+		// PointExecve doesn't populate Fd, so it defaults to 0.
+		if p.Fd != 0 {
+			return fmt.Errorf("execve invalid FD: %d", p.Fd)
+		}
+		if want := "/tmp/test_symlink"; want != p.Pathname {
+			return fmt.Errorf("wrong Pathname, got: %q, want: %q", p.Pathname, want)
+		}
+	} else {
+		// PointExecveat gets a dirfd that is explicitly opened by the workload so it is >= 3.
+		if p.Fd < 3 {
+			return fmt.Errorf("execve invalid FD: %d", p.Fd)
+		}
+		if want := "/"; want != p.FdPath {
+			return fmt.Errorf("wrong FdPath, got: %q, want: %q", p.FdPath, want)
+		}
+		if want := "/bin/true"; want != p.Pathname {
+			return fmt.Errorf("wrong Pathname, got: %q, want: %q", p.Pathname, want)
+		}
+		if p.Argv[0] != p.Pathname {
+			return fmt.Errorf("wrong Argv[0], got: %q, want: %q", p.Argv[0], p.Pathname)
+		}
 	}
 	if len(p.Envv) == 0 {
 		return fmt.Errorf("empty Envv")
 	}
 	if want := "TEST=123"; want != p.Envv[0] {
-		return fmt.Errorf("wrong Envv[0], want: %q, got: %q", want, p.Envv[0])
+		return fmt.Errorf("wrong Envv[0], got: %q, want: %q", p.Envv[0], want)
 	}
 	return nil
 }
@@ -672,6 +751,32 @@ func checkSyscallAccept(msg test.Message) error {
 	return nil
 }
 
+func checkSyscallListen(msg test.Message) error {
+	p := pb.Listen{}
+	if err := proto.Unmarshal(msg.Msg, &p); err != nil {
+		return err
+	}
+	if err := checkContextData(p.ContextData); err != nil {
+		return err
+	}
+	if p.Fd < 0 {
+		return fmt.Errorf("invalid fd: %d", p.Fd)
+	}
+	if p.FdPath == "" {
+		return fmt.Errorf("invalid path: %v", p.FdPath)
+	}
+	if len(p.Address) == 0 {
+		return fmt.Errorf("invalid address: %d", len(p.Address))
+	}
+	if p.SocketFamily != int32(unix.AF_UNIX) {
+		return fmt.Errorf("invalid socket family got: %d", p.SocketFamily)
+	}
+	if p.SocketType != int32(unix.SOCK_STREAM) && p.SocketType != int32(unix.SOCK_SEQPACKET) {
+		return fmt.Errorf("invalid socket type got: %d", p.SocketType)
+	}
+	return nil
+}
+
 func checkSyscallChroot(msg test.Message) error {
 	p := pb.Chroot{}
 	if err := proto.Unmarshal(msg.Msg, &p); err != nil {
@@ -681,7 +786,7 @@ func checkSyscallChroot(msg test.Message) error {
 		return err
 	}
 	if want := "trace_test.abc"; !strings.Contains(p.Pathname, want) {
-		return fmt.Errorf("wrong pathname, want: %q, got: %q", want, p.Pathname)
+		return fmt.Errorf("wrong pathname, got: %q, want substring: %q", p.Pathname, want)
 	}
 
 	return nil
@@ -857,7 +962,7 @@ func checkSyscallInotifyInitAddWatch(msg test.Message) error {
 		return fmt.Errorf("wrong pathname, got: %q, want: %q", p.Pathname, want)
 	}
 	if want := unix.IN_NONBLOCK; want != int(p.Mask) {
-		return fmt.Errorf("invalid mask: want: %v, got:%v", want, p.Mask)
+		return fmt.Errorf("invalid mask: got: %v, want: %v", p.Mask, want)
 	}
 	return nil
 }

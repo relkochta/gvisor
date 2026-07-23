@@ -135,10 +135,14 @@ $(RUNTIME_BIN): # See below.
 	@mkdir -p "$(RUNTIME_DIR)"
 ifeq (,$(STAGED_BINARIES))
 	@$(call copy,$(RUNSC_TARGET),$(RUNTIME_BIN))
+	@# Install sidecar binaries next to `RUNTIME_BIN`:
+	@$(call copy,//debian:gvisor-bin-tar,$(RUNTIME_DIR))
+	@tar -C "$(RUNTIME_DIR)" -xf "$(RUNTIME_DIR)/gvisor-bin-tar.tar"
+	@rm -f "$(RUNTIME_DIR)/gvisor-bin-tar.tar"
 else
 	gcloud storage cat "${STAGED_BINARIES}" | \
-	  tar -C "$(RUNTIME_DIR)" -zxvf - runsc && \
-	  chmod a+rx "$(RUNTIME_BIN)"
+	  tar -C "$(RUNTIME_DIR)" -zxvf - ./runsc ./gvisor-bin && \
+	  chmod -R a+rx "$(RUNTIME_BIN)" "$(RUNTIME_DIR)/gvisor-bin"
 endif
 .PHONY: $(RUNTIME_BIN) # Real file, but force rebuild.
 
@@ -150,7 +154,9 @@ configure_noreload = \
 
 reload_docker = \
   $(call header,DOCKER RELOAD); \
-  bash -xc "$(DOCKER_RELOAD_COMMAND)" && \
+  ( timeout --kill-after=20s 15s bash -xc "$(DOCKER_RELOAD_COMMAND)" || timeout --kill-after=20s 15s bash -xc "$(DOCKER_RELOAD_COMMAND)" || timeout --kill-after=20s 15s bash -xc "$(DOCKER_RELOAD_COMMAND)" ) && \
+  sleep 3 && \
+  ( $(MAKE) ensure-bazel-server || echo 'Failed to reload bazel-server container' >&2 ) && \
   if test -f /etc/docker/daemon.json; then \
     sudo chmod 0755 /etc/docker && \
     sudo chmod 0644 /etc/docker/daemon.json; \
@@ -232,7 +238,7 @@ nogo-tests:
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//test/trace:trace_test)
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//test/trace:trace_test)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
@@ -249,7 +255,7 @@ integration-tests: docker-tests overlay-tests hostnet-tests swgso-tests
 integration-tests: do-tests kvm-tests containerd-tests-min
 .PHONY: integration-tests
 
-integration-test-images: load-image-test load-basic
+integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services
 .PHONY: integration-test-images
 
 network-tests: ## Run all networking integration tests.
@@ -308,12 +314,14 @@ gpu-smoke-tests: gpu-smoke-images $(RUNTIME_BIN)
 	@$(call sudo,test/gpu:smoke_test,--runtime=runc -test.v $(ARGS))
 	@$(call install_runtime,$(RUNTIME),--nvproxy=true)
 	@$(call sudo,test/gpu:smoke_test,--runtime=$(RUNTIME) -test.v $(ARGS))
+	@$(call sudo,test/gpu:sr_test,--runtime=$(RUNTIME) -test.v $(ARGS))
 .PHONY: gpu-smoke-tests
 
 cos-gpu-smoke-tests: gpu-smoke-images $(RUNTIME_BIN)
 	@$(call sudo,test/gpu:smoke_test,--runtime=runc -test.v --cos-gpu $(ARGS))
 	@$(call install_runtime,$(RUNTIME),--nvproxy=true)
 	@$(call sudo,test/gpu:smoke_test,--runtime=$(RUNTIME) -test.v --cos-gpu $(ARGS))
+	@$(call sudo,test/gpu:sr_test,--runtime=$(RUNTIME) -test.v --cos-gpu $(ARGS))
 .PHONY: cos-gpu-smoke-tests
 
 # Images needed for GPU tests.
@@ -393,6 +401,7 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME)-dcache,--fdlimit=2000 --dcache=100) # Used by TestDentryCacheLimit.
 	@$(call install_runtime,$(RUNTIME)-host-uds,--host-uds=all) # Used by TestHostSocketConnect.
 	@$(call install_runtime,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
+	@$(call install_runtime,$(RUNTIME)-cgroupv2,--mount-cgroup-v2) # Used by TestSystemd*.
 	@$(call test_runtime_cached,$(RUNTIME),$(INTEGRATION_TARGETS) --test_env=TEST_SAVE_RESTORE_NETSTACK=true //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test)
 .PHONY: docker-tests
 
@@ -464,6 +473,10 @@ nftables-syscall-runc-tests: load-nftables
 	@$(call build_paths,//test/syscalls/linux:socket_netlink_netfilter_test,docker run $(DOCKER_RUN_OPTIONS) --user 0:0 --runtime runc --rm gvisor.dev/images/nftables {})
 .PHONY: nftables-syscall-runc-tests
 
+bwrap-tests: $(RUNTIME_BIN)
+	@$(call sudo,//runsc/cmd/alias/bwrap:bwrap_integration_test,-test.v -runsc=$(RUNTIME_BIN))
+.PHONY: bwrap-tests
+
 packetdrill-tests: load-packetdrill $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME),) # Clear flags.
 	@$(call test_runtime,$(RUNTIME),//test/packetdrill:all_tests)
@@ -504,10 +517,6 @@ containerd-performance-test-%:
 	@export RUN_SHIM_GROUPING_PERFORMANCE_TEST=true; $(MAKE) containerd-test-$*
 .PHONY: containerd-performance-test-%
 
-# Test runsc go binding.
-go-binding-test: $(RUNTIME_BIN)
-	@export RUNSC_PATH="$(RUNTIME_BIN)"; $(call run,test/root:go_binding_test, -test.v $(ARGS))
-.PHONY: go-binding-test
 
 kubernetes-smoke-test: ## Runs the Kubernetes hello test in a KIND cluster.
 	@test/kubernetes/scripts/run_kind_e2e.sh //test/kubernetes/tests:hello_test
@@ -567,15 +576,22 @@ run_benchmark = \
 	fi; \
 	rm -rf $$T)
 
+# TODO: b/529809802 - Enable benchmarks for slimvm.
 benchmark-platforms: load-benchmarks $(RUNTIME_BIN) ## Runs benchmarks for runc and all (selected) platforms.
 	@set -xe; if test -z "$(BENCHMARKS_PLATFORMS)"; then \
 	  for PLATFORM in $$($(RUNTIME_BIN) help platforms); do \
+	    if test "$${PLATFORM}" = "slimvm"; then \
+	      continue; \
+	    fi; \
 	    export PLATFORM; \
 	    $(call install_runtime,$${PLATFORM},--platform $${PLATFORM} --profile); \
 	    $(call run_benchmark,$${PLATFORM}); \
 	  done; \
 	else \
 	  for PLATFORM in $(BENCHMARKS_PLATFORMS); do \
+	    if test "$${PLATFORM}" = "slimvm"; then \
+	      continue; \
+	    fi; \
 	    export PLATFORM; \
 	    $(call install_runtime,$${PLATFORM},--platform $${PLATFORM} --profile); \
 	    $(call run_benchmark,$${PLATFORM}); \
@@ -602,6 +618,7 @@ BENCHMARKS_PGO_REFRESH_THRESHOLD ?= 0.7
 # of the repository size.
 BENCHMARKS_PGO_REFRESH_MIN_DAYS_SINCE_LAST_UPDATE ?= 28
 
+# TODO: b/529809802 - Enable benchmarks for slimvm.
 benchmark-refresh-pgo: load-benchmarks $(RUNTIME_BIN) ## Refresh profiles of all benchmarks for PGO purposes.
 	@set -e; if test -z "$(BENCHMARKS_PLATFORMS)"; then \
 		echo 'Must specify BENCHMARKS_PLATFORMS.' >&2; \
@@ -612,6 +629,9 @@ benchmark-refresh-pgo: load-benchmarks $(RUNTIME_BIN) ## Refresh profiles of all
 		PGO_LAST_PKG_COMMIT_HASH="$$(git log --max-count=1 --format='%H' -- pkg)"; \
 		export PGO_LAST_PKG_COMMIT_HASH; \
 		for PLATFORM in $(BENCHMARKS_PLATFORMS); do \
+			if test "$${PLATFORM}" = "slimvm"; then \
+				continue; \
+			fi; \
 			export PLATFORM; \
 			mkdir -p "$(REPO_DIR)/runsc/profiles/data/$${PGO_RUNTIME_KEY}_$${PLATFORM}"; \
 			PLATFORM_TMPDIR="$$(mktemp --tmpdir=/tmp --directory "pgo_$${PGO_RUNTIME_KEY}_$${PLATFORM}.XXXXXXXX")"; \
@@ -797,11 +817,29 @@ $(RELEASE_ARTIFACTS)/%:
 	@$(call copy,//runsc/cmd/metricserver:runsc-metric-server,$@)
 	@$(call copy,//shim:containerd-shim-runsc-v1,$@)
 	@$(call copy,//debian:debian,$@)
+	@$(call copy,//debian:gvisor-release-tar,$@)
 
 release: $(RELEASE_KEY) $(RELEASE_ARTIFACTS)/$(ARCH)
 	@mkdir -p $(RELEASE_ROOT)
 	@NIGHTLY=$(RELEASE_NIGHTLY) tools/make_release.sh $(RELEASE_KEY) $(RELEASE_ROOT) $$(find $(RELEASE_ARTIFACTS) -type f)
 .PHONY: release
+
+staged-binaries-check: ## Verifies STAGED_BINARIES contains all files from the //debian:gvisor-release-tar fileset.
+ifeq (,$(STAGED_BINARIES))
+	@echo "STAGED_BINARIES not set; nothing to check."
+else
+	@# T is exported so the nested `cp` inside the copy macro (a child process)
+	@# sees it; the rest of the recipe runs in this shell directly.
+	@export T=$$(mktemp -d --tmpdir staged-check.XXXXXX); \
+	$(call copy,//debian:gvisor-release-tar,$$T) && \
+	tar -tjf "$$T/gvisor.tar.bz2" | sed 's#^\./##' | grep -v '/$$' | sort >"$$T/release.txt" && \
+	gcloud storage cat "$(STAGED_BINARIES)" | tar -tzf - | sed 's#^\./##' | grep -v '/$$' | sort >"$$T/staged.txt" && \
+	comm -23 "$$T/release.txt" "$$T/staged.txt" >"$$T/missing.txt" && \
+	test ! -s "$$T/missing.txt" \
+	  || { echo "ERROR: STAGED_BINARIES missing members from //debian:gvisor-release-tar:" >&2; cat "$$T/missing.txt" >&2; rm -rf "$$T"; exit 1; }; \
+	rm -rf "$$T"
+endif
+.PHONY: staged-binaries-check
 
 tag: ## Creates and pushes a release tag.
 	@tools/tag_release.sh "$(RELEASE_COMMIT)" "$(RELEASE_NAME)" "$(RELEASE_NOTES)"

@@ -82,11 +82,16 @@ func newPayloadLoad(base payloadBase, offset uint8, blen int, dreg uint8) (*payl
 	return &payloadLoad{base: base, offset: offset, blen: blen, dregIdx: dregIdx}, nil
 }
 
+func (op *payloadLoad) deepCopy() operation {
+	opCopy := *op
+	return &opCopy
+}
+
 // evaluate for PayloadLoad loads data from the packet payload into the
 // destination register.
-func (op payloadLoad) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule) {
+func (op payloadLoad) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 	// Gets the packet payload.
-	payload := getPayloadBuffer(pkt, op.base)
+	payload := getPayloadBuffer(evalCtx.pkt, op.base)
 
 	// Breaks if could not retrieve packet data.
 	if payload == nil || len(payload) < int(op.offset)+op.blen {
@@ -126,9 +131,14 @@ func (op payloadLoad) GetExprName() string {
 
 func (op payloadLoad) Dump() ([]byte, *syserr.AnnotatedError) {
 	m := &nlmsg.Message{}
-	m.PutAttr(linux.NFTA_PAYLOAD_DREG, nlmsg.PutU32(formatRegIdxForDump(op.dregIdx)))
+	m.PutAttr(linux.NFTA_PAYLOAD_DREG, formatRegIdxForDump(op.dregIdx))
 	m.PutAttr(linux.NFTA_PAYLOAD_BASE, nlmsg.PutU32(uint32(op.base)))
 	m.PutAttr(linux.NFTA_PAYLOAD_OFFSET, nlmsg.PutU32(uint32(op.offset)))
 	m.PutAttr(linux.NFTA_PAYLOAD_LEN, nlmsg.PutU32(uint32(op.blen)))
 	return m.Buffer(), nil
+}
+
+// checkCompatibility implements operation.checkCompatibility.
+func (op payloadLoad) checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError {
+	return nil
 }

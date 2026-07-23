@@ -57,7 +57,7 @@ type PageTables struct {
 	// own the ranges that are shared with other Pagetables.
 	readOnlyShared bool
 
-	// largeAddressesEnabled indicates the Pagetables support addresess
+	// largeAddressesEnabled indicates the Pagetables support addresses
 	// larger than 48 bits.
 	largeAddressesEnabled bool
 }
@@ -330,4 +330,18 @@ func (p *PageTables) Lookup(addr hostarch.Addr, findFirst bool) (virtual hostarc
 // It is usually used on the pagetables that are used as the upper
 func (p *PageTables) MarkReadOnlyShared() {
 	p.readOnlyShared = true
+}
+
+// PrefaultRootTable touches the root table page to be sure that its physical
+// page is mapped. The runtime allocator backs PTEs with plain Go heap pages
+// (new(PTEs), no mlock / MAP_POPULATE / memfile pinning), so Linux can
+// reclaim the root page under memory pressure. Touching it from sentry
+// context right before SwitchToUser guarantees the page is resident when
+// iret/sysret loads CR3, avoiding rare host page faults that have been
+// observed to manifest as vCPU bounce stalls (state=7, userExits stuck).
+//
+//go:nosplit
+//go:noinline
+func (p *PageTables) PrefaultRootTable() PTE {
+	return p.root[0]
 }

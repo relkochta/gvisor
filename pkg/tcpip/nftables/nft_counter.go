@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // counter is an operation that increments a counter for the packets and number
@@ -41,9 +40,13 @@ func newCounter(startBytes, startPackets uint64) *counter {
 	return cntr
 }
 
+func (op *counter) deepCopy() operation {
+	return newCounter(op.bytes.Load(), op.packets.Load())
+}
+
 // evaluate for counter increments the counter for the packet and bytes.
-func (op *counter) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule) {
-	op.bytes.Add(uint64(pkt.Size()))
+func (op *counter) evaluate(regs *registerSet, evalCtx opEvalCtx) {
+	op.bytes.Add(uint64(evalCtx.pkt.Size()))
 	op.packets.Add(1)
 }
 
@@ -58,17 +61,22 @@ func (op *counter) Dump() ([]byte, *syserr.AnnotatedError) {
 	return m.Buffer(), nil
 }
 
+// checkCompatibility implements operation.checkCompatibility.
+func (op *counter) checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError {
+	return nil
+}
+
 var counterAttrPolicy = []NlaPolicy{
 	linux.NFTA_COUNTER_PACKETS: NlaPolicy{nlaType: linux.NLA_U64},
 	linux.NFTA_COUNTER_BYTES:   NlaPolicy{nlaType: linux.NLA_U64},
 }
 
-func initCounter(tab *Table, exprInfo ExprInfo) (*counter, *syserr.AnnotatedError) {
-	attrs, ok := NfParseWithOpts(exprInfo.ExprData, &NfParseOpts{
+func initCounter(exprInfo ExprInfo) (*counter, *syserr.AnnotatedError) {
+	attrs, err := NfParseWithOpts(exprInfo.ExprData, &NfParseOpts{
 		Policy: counterAttrPolicy,
 	})
-	if !ok {
-		return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Failed to parse counter expression data")
+	if err != nil {
+		return nil, err
 	}
 	// Nftables uses 0 as the default value for both bytes and packets if the
 	// attributes are not specified.

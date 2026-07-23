@@ -44,38 +44,59 @@ type natOp struct {
 	flags uint16
 }
 
-// regIdxOrDefault returns the register index if it is valid
-// otherwise returns the default value.
-func regIdxOrDefault(reg int8, len int, defaultIdx int8) int8 {
-	if reg < 0 {
-		return defaultIdx
-	}
-	v, err := regNumToIdx(uint8(reg), len)
-	if err == nil {
-		return int8(v)
-	}
-	return defaultIdx
-}
-
 // newNATOp creates a new NAT operation.
-func newNATOp(nt, family uint8, sregAddrMin, sregAddrMax, sregProtoMin, sregProtoMax int8, flags uint16) (*natOp, *syserr.AnnotatedError) {
+func newNATOp(nt, family uint8, sregAddrMin, sregAddrMax, sregProtoMin, sregProtoMax int, flags uint16) (*natOp, *syserr.AnnotatedError) {
+	const unsetReg = -1
+	regIdxOrDefault := func(reg int, len int, defaultIdx int8) (int8, *syserr.AnnotatedError) {
+		if reg == unsetReg {
+			return defaultIdx, nil
+		}
+		v, err := regNumToIdx(uint8(reg), len)
+		if err != nil {
+			return -1, err
+		}
+		return int8(v), nil
+	}
+
 	natOp := &natOp{
 		family: family,
 		flags:  flags,
 	}
 	natOp.manipType = stack.ToNATType(nt)
 	if natOp.manipType == stack.NATUnknown {
-		return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Invalid NAT type")
+		return nil, syserr.NewAnnotatedError(syserr.ErrNotSupported, "Nftables: Invalid NAT type")
 	}
 	len := header.IPv4AddressSize
 	if family == linux.NFPROTO_IPV6 {
 		len = header.IPv6AddressSize
 	}
-	natOp.sregAddrMinIdx = regIdxOrDefault(sregAddrMin, len, -1 /*defaultIdx*/)
-	natOp.sregAddrMaxIdx = regIdxOrDefault(sregAddrMax, len, natOp.sregAddrMinIdx)
-	natOp.sregProtoMinIdx = regIdxOrDefault(sregProtoMin, 2 /*len*/, -1)
-	natOp.sregProtoMaxIdx = regIdxOrDefault(sregProtoMax, 2 /*len*/, natOp.sregProtoMinIdx)
+
+	var err *syserr.AnnotatedError
+	if natOp.sregAddrMinIdx, err = regIdxOrDefault(sregAddrMin, len, unsetReg); err != nil {
+		return nil, err
+	}
+
+	// addr max is set to min if not set.
+	if natOp.sregAddrMaxIdx, err = regIdxOrDefault(sregAddrMax, len, natOp.sregAddrMinIdx); err != nil {
+		return nil, err
+	}
+
+	protoLen := linux.SizeOfNfConntrackManProto
+	if natOp.sregProtoMinIdx, err = regIdxOrDefault(sregProtoMin, protoLen, unsetReg); err != nil {
+		return nil, err
+	}
+
+	// proto max is set to proto min if not set.
+	if natOp.sregProtoMaxIdx, err = regIdxOrDefault(sregProtoMax, protoLen, natOp.sregProtoMinIdx); err != nil {
+		return nil, err
+	}
+
 	return natOp, nil
+}
+
+func (n *natOp) deepCopy() operation {
+	opCopy := *n
+	return &opCopy
 }
 
 // nfNatRange is the equivalent of struct nf_nat_range2 in Linux.
@@ -87,7 +108,7 @@ type nfNatRange struct {
 	flags    uint16
 }
 
-// setupAddr returns the min and max addresses from the register set.
+// getAddrRange returns the min and max addresses from the register set.
 func (n *natOp) getAddrRange(regs *registerSet) (minAddr, maxAddr tcpip.Address) {
 	regBuffer := regs.data
 	sz := header.IPv4AddressSize
@@ -153,7 +174,24 @@ func (n *natOp) setupNetmap(pkt *stack.PacketBuffer, minAddr, maxAddr *tcpip.Add
 
 // evaluate performs NAT setup on the connection.
 // Called when the packet matches the NAT op configured.
-func (n *natOp) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule) {
+func (n *natOp) evaluate(regs *registerSet, evalCtx opEvalCtx) {
+	pkt := evalCtx.pkt
+	// Skip the rule if the packet's family does not match the configured rule
+	// family. With an `inet` table the same base chain is dispatched for both
+	// IPv4 and IPv6 packets, so this mismatch is reachable in practice and
+	// must not panic inside setupNetmap. Matches the behavior of nft_nat_eval
+	// in linux/net/netfilter/nft_nat.c.
+	switch n.family {
+	case linux.NFPROTO_IPV4:
+		if pkt.NetworkProtocolNumber != header.IPv4ProtocolNumber {
+			return
+		}
+	case linux.NFPROTO_IPV6:
+		if pkt.NetworkProtocolNumber != header.IPv6ProtocolNumber {
+			return
+		}
+	}
+
 	// Just fill the data for the NAT operation.
 	changeAddress := false
 	changePort := false
@@ -182,35 +220,44 @@ func (n *natOp) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule)
 		regs.verdict.Code = VC(linux.NF_DROP)
 		return
 	}
+	// NAT successful, set verdict to ACCEPT.
+	regs.verdict.Code = VC(linux.NF_ACCEPT)
 }
 
+// GetExprName returns the name of the expression.
 func (n *natOp) GetExprName() string {
 	return OpTypeNAT.String()
 }
 
+// Dump dumps the operation info.
 func (n *natOp) Dump() ([]byte, *syserr.AnnotatedError) {
 	log.Warningf("Nftables: natOp.Dump() is not implemented")
 	return nil, nil
 }
 
+// checkCompatibility implements operation.checkCompatibility.
+func (n *natOp) checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError {
+	return nil
+}
+
 var natAttrPolicy = []NlaPolicy{
 	linux.NFTA_NAT_TYPE:          {nlaType: linux.NLA_U32},
 	linux.NFTA_NAT_FAMILY:        {nlaType: linux.NLA_U32},
-	linux.NFTA_NAT_REG_ADDR_MIN:  {nlaType: linux.NLA_U32},
-	linux.NFTA_NAT_REG_ADDR_MAX:  {nlaType: linux.NLA_U32},
-	linux.NFTA_NAT_REG_PROTO_MIN: {nlaType: linux.NLA_U32},
-	linux.NFTA_NAT_REG_PROTO_MAX: {nlaType: linux.NLA_U32},
+	linux.NFTA_NAT_REG_ADDR_MIN:  {nlaType: linux.NLA_BE32, validator: AttrMaxValidator[uint32](255)},
+	linux.NFTA_NAT_REG_ADDR_MAX:  {nlaType: linux.NLA_BE32, validator: AttrMaxValidator[uint32](255)},
+	linux.NFTA_NAT_REG_PROTO_MIN: {nlaType: linux.NLA_BE32, validator: AttrMaxValidator[uint32](255)},
+	linux.NFTA_NAT_REG_PROTO_MAX: {nlaType: linux.NLA_BE32, validator: AttrMaxValidator[uint32](255)},
 	linux.NFTA_NAT_FLAGS:         {nlaType: linux.NLA_BE32, validator: AttrMaskValidator[uint32](linux.NF_NAT_RANGE_MASK)},
 }
 
 // initNATOp initializes a NAT operation from the given expression information.
 // Similar to `nft_nat_init` in kernel.
 func initNATOp(tab *Table, exprInfo ExprInfo) (*natOp, *syserr.AnnotatedError) {
-	attrs, ok := NfParseWithOpts(exprInfo.ExprData, &NfParseOpts{
+	attrs, parseErr := NfParseWithOpts(exprInfo.ExprData, &NfParseOpts{
 		Policy: natAttrPolicy,
 	})
-	if !ok {
-		return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Failed to parse NAT expression data")
+	if parseErr != nil {
+		return nil, parseErr
 	}
 
 	nt, typeOk := AttrNetToHost[uint32](linux.NFTA_NAT_TYPE, attrs)
@@ -235,26 +282,26 @@ func initNATOp(tab *Table, exprInfo ExprInfo) (*natOp, *syserr.AnnotatedError) {
 	}
 
 	flags, _ := AttrNetToHost[uint32](linux.NFTA_NAT_FLAGS, attrs)
-	sregAddrMin, sregAddrMax := int8(-1), int8(-1)
+	sregAddrMin, sregAddrMax := -1, -1
 	if regAddrMinOk {
-		sregAddrMin = int8(regAddrMin)
+		sregAddrMin = int(regAddrMin)
 		regAddrMax, regAddrMaxOk := AttrNetToHost[uint32](linux.NFTA_NAT_REG_ADDR_MAX, attrs)
 		if !regAddrMaxOk {
 			sregAddrMax = sregAddrMin
 		} else {
-			sregAddrMax = int8(regAddrMax)
+			sregAddrMax = int(regAddrMax)
 		}
 		flags |= linux.NF_NAT_RANGE_MAP_IPS
 	}
 
-	sregProtoMin, sregProtoMax := int8(-1), int8(-1)
+	sregProtoMin, sregProtoMax := -1, -1
 	if regProtoMinOk {
-		sregProtoMin = int8(regProtoMin)
+		sregProtoMin = int(regProtoMin)
 		regProtoMax, regProtoMaxOk := AttrNetToHost[uint32](linux.NFTA_NAT_REG_PROTO_MAX, attrs)
 		if !regProtoMaxOk {
 			sregProtoMax = sregProtoMin
 		} else {
-			sregProtoMax = int8(regProtoMax)
+			sregProtoMax = int(regProtoMax)
 		}
 		flags |= linux.NF_NAT_RANGE_PROTO_SPECIFIED
 	}

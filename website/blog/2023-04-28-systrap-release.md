@@ -102,7 +102,7 @@ performance. To get a better picture of the magnitude of improvement, here are
 some real-world workloads:
 
 *   The
-    [Build ABSL benchmark](https://github.com/google/gvisor/blob/master/blob/master/test/benchmarks/fs/bazel_test.go)
+    [Build ABSL benchmark](https://github.com/relkochta/gvisor/blob/master/blob/master/test/benchmarks/fs/bazel_test.go)
     measures compilation performance by compiling
     [abseil.io](https://abseil.io/); this is a highly system call dependent
     workload due to needing to do a lot of I/O filesystem operations (gVisor’s
@@ -110,12 +110,12 @@ some real-world workloads:
     implements, which is something you can learn about
     [here](https://gvisor.dev/docs/user_guide/filesystem/)).
 *   The
-    [ffmpeg benchmark](https://github.com/google/gvisor/blob/master/blob/master/test/benchmarks/media/ffmpeg_test.go)
+    [ffmpeg benchmark](https://github.com/relkochta/gvisor/blob/master/blob/master/test/benchmarks/media/ffmpeg_test.go)
     runs a multimedia processing tool, to perform video stream encoding/decoding
     for example; this workload does not require a significant amount of system
     calls and there are very few userspace to kernel mode switches.
 *   The
-    [Tensorflow benchmark](https://github.com/google/gvisor/blob/master/blob/master/test/benchmarks/ml/tensorflow_test.go)
+    [Tensorflow benchmark](https://github.com/relkochta/gvisor/blob/master/blob/master/test/benchmarks/ml/tensorflow_test.go)
     trains a variety of machine learning models on CPU; the system-call usage of
     this workload is in between compilation and ffmpeg, due to needing to
     retrieve training and validation data, but the majority of time is still

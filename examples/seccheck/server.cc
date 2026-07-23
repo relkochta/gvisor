@@ -125,6 +125,9 @@ std::vector<Callback> dispatchers = {
     unpackSyscall<::gvisor::syscall::InotifyRmWatch>,
     unpackSyscall<::gvisor::syscall::SocketPair>,
     unpackSyscall<::gvisor::syscall::Write>,
+    unpack<::gvisor::sentry::MmapInfo>,
+    unpackSyscall<::gvisor::syscall::Mmap>,
+    unpackSyscall<::gvisor::syscall::Listen>,
 };
 
 void unpack(absl::string_view buf) {

@@ -19,6 +19,7 @@ package platform
 
 import (
 	"fmt"
+	"sort"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -151,40 +152,44 @@ func (NoCPUNumbers) PreemptCPU(int32) error {
 }
 
 // UseHostGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier and
-// Platform.GlobalMemoryBarrier by invoking equivalent functionality on the
-// host.
-type UseHostGlobalMemoryBarrier struct{}
+// Platform.GlobalMemoryBarrier by invoking the host global memory barrier.
+// Platforms must populate `MemBarrier` from `<-hostmm.Probe(false)`.
+type UseHostGlobalMemoryBarrier struct {
+	MemBarrier hostmm.HostMemBarrier
+}
 
 // HaveGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier.
-func (UseHostGlobalMemoryBarrier) HaveGlobalMemoryBarrier() bool {
-	return hostmm.HaveGlobalMemoryBarrier()
+func (u UseHostGlobalMemoryBarrier) HaveGlobalMemoryBarrier() bool {
+	return u.MemBarrier.HaveGlobalMemoryBarrier()
 }
 
 // GlobalMemoryBarrier implements Platform.GlobalMemoryBarrier.
-func (UseHostGlobalMemoryBarrier) GlobalMemoryBarrier() error {
-	return hostmm.GlobalMemoryBarrier()
+func (u UseHostGlobalMemoryBarrier) GlobalMemoryBarrier() error {
+	return u.MemBarrier.GlobalMemoryBarrier()
 }
 
 // UseHostProcessMemoryBarrier implements Platform.HaveGlobalMemoryBarrier and
-// Platform.GlobalMemoryBarrier by invoking a process-local memory barrier.
-// This is faster than UseHostGlobalMemoryBarrier, but is only appropriate for
-// platforms for which application code executes while using the sentry's
-// mm_struct.
-type UseHostProcessMemoryBarrier struct{}
+// Platform.GlobalMemoryBarrier by preferring a process-local (private-expedited)
+// memory barrier, falling back to host global otherwise.
+// This is faster than UseHostGlobalMemoryBarrier, but only appropriate for
+// platforms for which application code executes while using the
+// sentry's mm_struct.
+// Platforms must populate `MemBarrier` from `<-hostmm.Probe(true)`.
+type UseHostProcessMemoryBarrier struct {
+	MemBarrier hostmm.HostMemBarrier
+}
 
 // HaveGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier.
-func (UseHostProcessMemoryBarrier) HaveGlobalMemoryBarrier() bool {
-	// Fall back to a global memory barrier if a process-local one isn't
-	// available.
-	return hostmm.HaveProcessMemoryBarrier() || hostmm.HaveGlobalMemoryBarrier()
+func (u UseHostProcessMemoryBarrier) HaveGlobalMemoryBarrier() bool {
+	return u.MemBarrier.HaveProcessMemoryBarrier() || u.MemBarrier.HaveGlobalMemoryBarrier()
 }
 
 // GlobalMemoryBarrier implements Platform.GlobalMemoryBarrier.
-func (UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
-	if hostmm.HaveProcessMemoryBarrier() {
-		return hostmm.ProcessMemoryBarrier()
+func (u UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
+	if u.MemBarrier.HaveProcessMemoryBarrier() {
+		return u.MemBarrier.ProcessMemoryBarrier()
 	}
-	return hostmm.GlobalMemoryBarrier()
+	return u.MemBarrier.GlobalMemoryBarrier()
 }
 
 // MemoryManager represents an abstraction above the platform address space
@@ -584,6 +589,9 @@ type Options struct {
 	// syscalls invocations sites at runtime.
 	DisableSyscallPatching bool
 
+	// DisableFastPath, if true, completely disables the Systrap fast path.
+	DisableFastPath bool
+
 	// ApplicationCores is used by KVM to determine the correct amount of
 	// vCPUs to create.
 	ApplicationCores int
@@ -592,6 +600,10 @@ type Options struct {
 	// as CPU numbers in the sentry. This is necessary to support features like
 	// rseq
 	UseCPUNums bool
+
+	// SandboxID is the sandbox identifier, used by slimvm to pass to the
+	// host kernel module for sandbox identification.
+	SandboxID string
 }
 
 // Constructor represents a platform type.
@@ -629,6 +641,7 @@ func List() (available []string) {
 	for name := range platforms {
 		available = append(available, name)
 	}
+	sort.Strings(available)
 	return
 }
 

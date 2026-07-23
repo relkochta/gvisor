@@ -19,8 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/test/netutils"
 )
@@ -30,6 +33,10 @@ var validationTests = []TestCase{
 	&JumpAndDropAll{},
 	&tcpDNAT{},
 	&tcpSNAT{},
+	&mapTest{},
+	&fibTest{},
+	&ctTest{},
+	&tcpMasq{},
 }
 
 func init() {
@@ -60,8 +67,9 @@ func (*JumpAndDropAll) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool
 		{"add", "chain", "inet", tableName, "FORWARDS_TO_DROP_CHAIN", "{ jump DROPS_ALL_CHAIN; }"},
 		// Create BASE_CHAIN with accept all policy.
 		{"add", "chain", "inet", tableName, "BASE_CHAIN", "{ type filter hook input priority 0; policy accept; }"},
-		// Add rule to BASE_CHAIN to jump to FORWARDS_TO_DROP_CHAIN.
-		{"add", "rule", "inet", tableName, "BASE_CHAIN", "jump", "FORWARDS_TO_DROP_CHAIN"},
+		// Add rule to BASE_CHAIN to jump to FORWARDS_TO_DROP_CHAIN
+		// if dport(0x0961) & 0x0fff == 0x961.
+		{"add", "rule", "inet", tableName, "BASE_CHAIN", "udp", "dport", "&", "0x0fff", "==", "0x0961", "jump", "FORWARDS_TO_DROP_CHAIN"},
 	}
 	// Run all the commands.
 	for _, cmd := range cmds {
@@ -196,6 +204,7 @@ func (*tcpDNAT) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 
 // Timeout implements TestCase.Timeout.
 func (*tcpDNAT) Timeout() time.Duration {
+	// TODO: b/486197011 - Reduce the timeout.
 	return 1 * time.Minute
 }
 
@@ -400,6 +409,7 @@ func (*udpDNAT) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 
 // Timeout implements TestCase.Timeout.
 func (*udpDNAT) Timeout() time.Duration {
+	// TODO: b/486197011 - Reduce the timeout.
 	return 1 * time.Minute
 }
 
@@ -504,5 +514,895 @@ func (*udpSNAT) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 
 // Timeout implements TestCase.Timeout.
 func (*udpSNAT) Timeout() time.Duration {
+	return 30 * time.Second
+}
+
+// mapTest tests installs Nftables rules such that:
+//  1. Incoming packets to port 9000 match a verdict map and jump to a sub-chain.
+//  2. In the sub-chain, the source IP should match a map and
+//     be translated to a new source IP.
+//  3. The packet is then forwarded to the destination port 9000.
+type mapTest struct{ containerCase }
+
+var _ TestCase = (*mapTest)(nil)
+
+func (*mapTest) Name() string {
+	return "mapTest"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+func (t *mapTest) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		log.Warningf("mapTest is not supported for IPv6 yet.")
+		return nil
+	}
+
+	snatAddr := "127.0.0.99"
+
+	//
+	if err := func() error {
+		// Start a listener on port 8999
+		// This verifies that:
+		//   a) the ContainerAction and the LocalAction can connect to each other.
+		//   b) sync with LocalAction that the nft-rules are programmed.
+		l1, err := net.Listen("tcp", "0.0.0.0:8999")
+		if err != nil {
+			return fmt.Errorf("initial net.Listen failed: %v", err)
+		}
+		defer l1.Close()
+
+		// 2. Program the rules targeting port 9000 while the client waits on 8999.
+		cmds := [][]string{
+			// Create NAT table.
+			{"add", "table", "inet", "nat"},
+			// Create input chain.
+			{"add", "chain", "inet", "nat", "input", "{ type nat hook input priority 100; }"},
+			// Create target sub-chain (non-base chain).
+			{"add", "chain", "inet", "nat", "snat_chain"},
+			// Create maps.
+			{"add", "map", "inet", "nat", "client_vmap", "{ type ipv4_addr : verdict; }"},
+			{"add", "map", "inet", "nat", "client_snat_map", "{ type ipv4_addr : ipv4_addr; }"},
+			// Add element to verdict map to jump to sub-chain.
+			{"add", "element", "inet", "nat", "client_vmap", fmt.Sprintf("{ %s : jump snat_chain }", ip.String())},
+			// Add element to normal map mapping client IP -> snatAddr.
+			{"add", "element", "inet", "nat", "client_snat_map", fmt.Sprintf("{ %s : %s }", ip.String(), snatAddr)},
+			// Add rule on base input chain to use vmap.
+			{"add", "rule", "inet", "nat", "input", "tcp", "dport", "9000", "ip", "saddr", "vmap", "@client_vmap"},
+			// Add rule inside snat_chain to apply SNAT map translation on matching packet.
+			{"add", "rule", "inet", "nat", "snat_chain", "snat", "ip", "to", "ip", "saddr", "map", "@client_snat_map"},
+		}
+
+		for _, cmd := range cmds {
+			if err := nftCmd(cmd); err != nil {
+				return fmt.Errorf("nft cmd: %v, failed with error: %v", cmd, err)
+			}
+		}
+
+		// Dump & list client_vmap and client_snat_map to verify map dump and setup.
+		out, err := nftCmdOut([]string{"list", "map", "inet", "nat", "client_vmap"})
+		if err != nil {
+			return fmt.Errorf("failed to list client_vmap: %v", err)
+		}
+		if !strings.Contains(out, ip.String()) || !strings.Contains(out, "jump snat_chain") {
+			return fmt.Errorf("unexpected verdict map dump output: %s", out)
+		}
+
+		out, err = nftCmdOut([]string{"list", "map", "inet", "nat", "client_snat_map"})
+		if err != nil {
+			return fmt.Errorf("failed to list client_snat_map: %v", err)
+		}
+		if !strings.Contains(out, ip.String()) || !strings.Contains(out, snatAddr) {
+			return fmt.Errorf("unexpected normal map dump output: %s", out)
+		}
+
+		// 3. Accept connection on 8999 to sync with the LocalAction.
+		errCh1 := make(chan error, 1)
+		go func() {
+			conn, err := l1.Accept()
+			if err != nil {
+				errCh1 <- err
+				return
+			}
+			conn.Close()
+			errCh1 <- nil
+		}()
+
+		select {
+		case err := <-errCh1:
+			if err != nil {
+				return err
+			}
+		case <-time.After(10 * time.Second):
+			return fmt.Errorf("timeout waiting for initial client TCP connection on port 8999")
+		}
+		return nil
+	}(); err != nil {
+		return err
+	}
+
+	// 4. Verify both maps behave correctly by listening on TCP port 9000.
+	// Packet must jump to snat_chain and get source IP translated to snatAddr.
+	l2, err := net.Listen("tcp", "0.0.0.0:9000")
+	if err != nil {
+		return fmt.Errorf("second net.Listen failed: %v", err)
+	}
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		defer l2.Close()
+		conn, err := l2.Accept()
+		if err != nil {
+			errCh2 <- err
+			return
+		}
+		defer conn.Close()
+
+		remoteAddr, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			errCh2 <- fmt.Errorf("failed to parse client address, err: %v", err)
+			return
+		}
+		if remoteAddr != snatAddr {
+			errCh2 <- fmt.Errorf("unexpected client address after SNAT: %s, expected: %s", remoteAddr, snatAddr)
+			return
+		}
+		errCh2 <- nil
+	}()
+
+	select {
+	case err := <-errCh2:
+		if err != nil {
+			return err
+		}
+	case <-time.After(15 * time.Second):
+		l2.Close()
+		return fmt.Errorf("timeout waiting for client TCP connection post-SNAT on port 9000")
+	}
+
+	return nil
+}
+
+// LocalAction implements TestCase.LocalAction.
+func (t *mapTest) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		return nil
+	}
+
+	dialAddr1 := net.JoinHostPort(ip.String(), "8999")
+	dialAddr2 := net.JoinHostPort(ip.String(), "9000")
+
+	// Sync by waiting for the container to be ready to accept connections on port 8999.
+	var conn1 net.Conn
+	var err error
+	for i := 0; i < 10; i++ {
+		conn1, err = net.Dial("tcp", dialAddr1)
+		if err == nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		return fmt.Errorf("first net.Dial failed: %v", err)
+	}
+	conn1.Close()
+
+	// Send a TCP packet to port 9000 to verify SNAT is working.
+	var conn2 net.Conn
+	for i := 0; i < 10; i++ {
+		conn2, err = net.Dial("tcp", dialAddr2)
+		if err == nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		return fmt.Errorf("second net.Dial failed: %v", err)
+	}
+	conn2.Close()
+
+	return nil
+}
+
+// Timeout implements TestCase.Timeout.
+func (*mapTest) Timeout() time.Duration {
+	return 30 * time.Second
+}
+
+// fibTest tests installs Nftables rules such that:
+//  1. Incoming packets to port 9005 match a FIB lookup.
+//  2. If matched, the packet is accepted. Otherwise dropped.
+type fibTest struct{ containerCase }
+
+var _ TestCase = (*fibTest)(nil)
+
+func (*fibTest) Name() string {
+	return "fibTest"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+func (t *fibTest) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		log.Warningf("fibTest is not supported for IPv6 yet.")
+		return nil
+	}
+
+	// Find the interface dynamically.
+	targetIface, ok := netutils.GetNonLoopbackInterface()
+	if !ok {
+		return fmt.Errorf("no non-loopback interface found")
+	}
+	log.Infof("FIB test using interface: %s (Index: %d)", targetIface.Name, targetIface.Index)
+
+	// install_rules
+	{
+		cmds := [][]string{
+			{"add", "table", "inet", "filter"},
+			// Policy set to drop by default; if FIB fails, packet should be dropped.
+			{"add", "chain", "inet", "filter", "input", "{ type filter hook input priority 0; policy drop; }"},
+			// Accept connections to 8995 to bypass drop policy for the test setup sync, also validate iifname.
+			{"add", "rule", "inet", "filter", "input", "tcp", "dport", "8995", "meta", "iifname", targetIface.Name, "accept"},
+			// Output Chain to validate oifname.
+			{"add", "chain", "inet", "filter", "output", "{ type filter hook output priority 0; policy drop; }"},
+			{"add", "rule", "inet", "filter", "output", "meta", "oifname", "lo", "accept"},
+			{"add", "rule", "inet", "filter", "output", "tcp", "sport", "8995", "meta", "oifname", targetIface.Name, "accept"},
+			// Try to trigger all the FIB paths and validate iifname.
+			{"add", "rule", "inet", "filter", "input", "udp", "dport", "9005",
+				"meta", "iifname", targetIface.Name,
+				"fib", "saddr", ".", "iif", "oif", fmt.Sprintf("%d", targetIface.Index),
+				"fib", "saddr", ".", "iif", "oifname", targetIface.Name,
+				"fib", "saddr", ".", "iif", "oif", "exists",
+				"fib", "saddr", ".", "iif", "oifname", "exists",
+				"fib", "saddr", "type", "unicast",
+				"fib", "daddr", "type", "local",
+				"accept"},
+		}
+
+		for _, cmd := range cmds {
+			if err := nftCmd(cmd); err != nil {
+				return fmt.Errorf("nft cmd: %v, failed with error: %v", cmd, err)
+			}
+		}
+		log.Infof("fibTest: NFT rules installed successfully")
+	}
+
+	// Verify that the UDP packets from outside the container can reach port 9005.
+	// This verifies that the FIB rules are evaluated correctly.
+	udpListener, err := net.ListenPacket("udp", "0.0.0.0:9005")
+	if err != nil {
+		return fmt.Errorf("UDP net.ListenPacket failed on 9005: %v", err)
+	}
+	defer udpListener.Close()
+	log.Infof("fibTest: Listening for UDP on port 9005")
+
+	udpErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			udpListener.SetReadDeadline(time.Now().Add(30 * time.Second))
+			n, _, err := udpListener.ReadFrom(buf)
+			if err != nil {
+				udpErrCh <- fmt.Errorf("failed receiving remote UDP packet: %v", err)
+				return
+			}
+			if string(buf[:n]) == "remote_test" {
+				break
+			}
+		}
+		udpErrCh <- nil
+	}()
+
+	// Sync setup with LocalAction.
+	{
+		syncListener, err := net.Listen("tcp", "0.0.0.0:8995")
+		if err != nil {
+			return fmt.Errorf("net.Listen failed on 8995: %v", err)
+		}
+		log.Infof("fibTest: Listening for sync connection on port 8995")
+
+		syncErrCh := make(chan error, 1)
+		go func() {
+			defer syncListener.Close()
+			conn, err := syncListener.Accept()
+			if err != nil {
+				syncErrCh <- err
+				return
+			}
+			defer conn.Close()
+			syncErrCh <- nil
+		}()
+
+		select {
+		case err := <-syncErrCh:
+			if err != nil {
+				return err
+			}
+			log.Infof("fibTest: Sync with LocalAction successful")
+		case <-time.After(15 * time.Second):
+			syncListener.Close()
+			return fmt.Errorf("timeout waiting for client TCP connection on 8995")
+		}
+	}
+
+	// Wait for remote UDP
+	select {
+	case err := <-udpErrCh:
+		if err != nil {
+			return err
+		}
+		log.Infof("fibTest: Received remote UDP packet 'remote_test'")
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("timeout waiting for remote client UDP connection on 9005")
+	}
+
+	// verify UDP negative logic (Local Loopback)
+	// Packets sent to itself (127.0.0.1) should fail the FIB interface check
+	// and be dropped by the default policy.
+	log.Infof("fibTest: Starting negative test (Local Loopback to 127.0.0.1:9005)")
+	conn, err := net.Dial("udp", "127.0.0.1:9005")
+	if err != nil {
+		return fmt.Errorf("local UDP dial failed: %v", err)
+	}
+
+	if _, err := conn.Write([]byte("local_test")); err != nil {
+		conn.Close()
+		return fmt.Errorf("failed to write local UDP packet: %v", err)
+	}
+	conn.Close()
+
+	// Read loop to verify local_test doesn't arrive.
+	buf := make([]byte, 1024)
+	udpListener.SetReadDeadline(time.Now().Add(1 * time.Second))
+	for {
+		n, _, err := udpListener.ReadFrom(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Infof("fibTest: Success! Local UDP packet was dropped (Timed out waiting for packet)")
+				break
+			}
+			return fmt.Errorf("unexpected error waiting for local UDP: %v", err)
+		}
+		if string(buf[:n]) == "local_test" {
+			return fmt.Errorf("local UDP transmission to 9005 succeeded when it should have been dropped")
+		}
+	}
+	return nil
+}
+
+// LocalAction implements TestCase.LocalAction.
+func (t *fibTest) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		return nil
+	}
+
+	// 1. Sync with ContainerAction by connecting to port 8995.
+	log.Infof("fibTest (LocalAction): Attempting to sync with container on port 8995")
+	{
+		addr := net.JoinHostPort(ip.String(), "8995")
+		var err error
+		var conn net.Conn
+		for i := 0; i < 10; i++ {
+			conn, err = net.Dial("tcp", addr)
+			if err == nil {
+				conn.Close()
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if err != nil {
+			return fmt.Errorf("sync dial failed: %v", err)
+		}
+		log.Infof("fibTest (LocalAction): Sync successful")
+	}
+
+	// 2. Validate that remote UDP packets reach Container..
+	log.Infof("fibTest (LocalAction): Sending remote UDP packets to container")
+	{
+		conn, err := net.Dial("udp", net.JoinHostPort(ip.String(), "9005"))
+		if err != nil {
+			return fmt.Errorf("udp dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		// Send multiple times to ensure delivery over UDP
+		for i := 0; i < 10; i++ {
+			conn.Write([]byte("remote_test"))
+			time.Sleep(1 * time.Second)
+		}
+		log.Infof("fibTest (LocalAction): Finished sending remote UDP packets")
+	}
+
+	return nil
+}
+
+// Timeout implements TestCase.Timeout.
+func (*fibTest) Timeout() time.Duration {
+	// TODO: b/486197011 - Reduce the timeout.
+	return 90 * time.Second
+}
+
+// ctTest verifies conntrack functionality.
+type ctTest struct{ containerCase }
+
+var _ TestCase = (*ctTest)(nil)
+
+func (*ctTest) Name() string {
+	return "ctTest"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+func (t *ctTest) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		log.Warningf("ctTest is not supported for IPv6 yet.")
+		return nil
+	}
+
+	// install_rules
+	{
+		cmds := [][]string{
+			{"add", "table", "inet", "filter"},
+			// Policy set to drop by default; if conntrack fails, packet should be dropped.
+			{"add", "chain", "inet", "filter", "input",
+				"{ type filter hook input priority 0; policy drop; }"},
+			// Accept connections to 8995 to bypass drop policy for the test setup sync
+			{"add", "rule", "inet", "filter", "input", "tcp", "dport", "8995", "accept"},
+			// Rule 1: Allow initial packet of a new connection.
+			{"add", "rule", "inet", "filter", "input", "tcp", "dport", "29008",
+				"ct", "state", "new",
+				"ct", "original", "protocol", "tcp",
+				"ct", "original", "proto-src", "29007",
+				"ct", "direction", "original",
+				"accept"},
+			// Rule 2: Allow all subsequent packets for connections that have already
+			// been established or are related to them.
+			{"add", "rule", "inet", "filter", "input", "ct", "state", "established,related", "accept"},
+			// Output Chain
+			{"add", "chain", "inet", "filter", "output", "{ type filter hook output priority 0; policy drop; }"},
+			// Accept LocalAction sync replies.
+			{"add", "rule", "inet", "filter", "output", "tcp", "sport", "8995", "accept"},
+			// Rule 3: Verify Reply packets on Output chain.
+			{"add", "rule", "inet", "filter", "output", "tcp", "sport", "29008",
+				"ct", "direction", "reply",
+				"ct", "reply", "proto-src", "29008",
+				"ct", "reply", "proto-dst", "29007",
+				"accept"},
+		}
+
+		for _, cmd := range cmds {
+			if err := nftCmd(cmd); err != nil {
+				return fmt.Errorf("nft cmd: %v, failed with error: %v", cmd, err)
+			}
+		}
+		log.Infof("ctTest: NFT rules installed successfully")
+	}
+
+	// Start listening on 29008.
+	l, err := net.Listen("tcp", "0.0.0.0:29008")
+	if err != nil {
+		return fmt.Errorf("net.Listen failed on 29008: %v", err)
+	}
+	defer l.Close()
+	log.Infof("ctTest: Listening for TCP on port 29008")
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if string(buf[:n]) == "remote_test" {
+			errCh <- nil
+		} else {
+			errCh <- fmt.Errorf("unexpected message: %s", string(buf[:n]))
+		}
+	}()
+
+	// Sync setup with LocalAction.
+	{
+		syncListener, err := net.Listen("tcp", "0.0.0.0:8995")
+		if err != nil {
+			return fmt.Errorf("net.Listen failed on 8995: %v", err)
+		}
+		log.Infof("ctTest: Listening for sync connection on port 8995")
+
+		syncErrCh := make(chan error, 1)
+		go func() {
+			defer syncListener.Close()
+			conn, err := syncListener.Accept()
+			if err != nil {
+				syncErrCh <- err
+				return
+			}
+			defer conn.Close()
+			syncErrCh <- nil
+		}()
+
+		select {
+		case err := <-syncErrCh:
+			if err != nil {
+				return err
+			}
+			log.Infof("ctTest: Sync with LocalAction successful")
+		case <-time.After(15 * time.Second):
+			syncListener.Close()
+			return fmt.Errorf("timeout waiting for client TCP connection on 8995")
+		}
+	}
+
+	// Wait for remote TCP
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+		log.Infof("ctTest: Received remote TCP packet 'remote_test'")
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("timeout waiting for remote client TCP connection on 29008")
+	}
+
+	return nil
+}
+
+// dialTCPWithReuseAddr dials a TCP connection with the SO_REUSEADDR and SO_LINGER option set.
+func dialTCPWithReuseAddr(ctx context.Context, localAddr, remoteAddr net.Addr) (net.Conn, error) {
+	d := net.Dialer{
+		LocalAddr: localAddr,
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+			})
+			return err
+		},
+	}
+	conn, err := d.DialContext(ctx, "tcp", remoteAddr.String())
+	if err != nil {
+		return nil, err
+	}
+	conn.(*net.TCPConn).SetLinger(0)
+	return conn, nil
+}
+
+// LocalAction implements TestCase.LocalAction.
+func (t *ctTest) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		// ctTest is not supported for IPv6 yet.
+		return nil
+	}
+
+	// 1. Sync with ContainerAction setup.
+	{
+		log.Infof("ctTest (LocalAction): Waiting for sync...")
+		var conn net.Conn
+		var err error
+		for i := 0; i < 10; i++ {
+			conn, err = net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "8995"), 2*time.Second)
+			if err == nil {
+				conn.Close()
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if err != nil {
+			return fmt.Errorf("sync dial failed: %v", err)
+		}
+		log.Infof("ctTest (LocalAction): Sync successful")
+	}
+
+	// 2. Connect using source port 29007 (allowed port).
+	log.Infof("ctTest (LocalAction): Sending positive TCP packets to container (port 29007 -> 29008)")
+	{
+		localAddr, err := net.ResolveTCPAddr("tcp", "0.0.0.0:29007")
+		if err != nil {
+			return fmt.Errorf("resolve local TCP addr failed: %v", err)
+		}
+		remoteAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(ip.String(), "29008"))
+		if err != nil {
+			return fmt.Errorf("resolve remote TCP addr failed: %v", err)
+		}
+
+		dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer dialCancel()
+		conn, err := dialTCPWithReuseAddr(dialCtx, localAddr, remoteAddr)
+		if err != nil {
+			return fmt.Errorf("positive TCP dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte("remote_test")); err != nil {
+			return fmt.Errorf("failed to write positive TCP payload: %v", err)
+		}
+		log.Infof("ctTest (LocalAction): Finished sending positive TCP packets")
+	}
+
+	// 3. Negative Test: Connecting using ephemeral port should be dropped.
+	log.Infof("ctTest (LocalAction): Sending negative TCP packets to container (ephemeral port -> 29008)")
+	{
+		// Expect this to timeout or fail to connect because it won't match proto-src 29007.
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "29008"), 5*time.Second)
+		if err == nil {
+			conn.Close()
+			return fmt.Errorf("TCP connection succeeded when it should have been dropped")
+		}
+		log.Infof("ctTest (LocalAction): Connection failed as expected: %v", err)
+	}
+
+	return nil
+}
+
+// Timeout implements TestCase.Timeout.
+func (*ctTest) Timeout() time.Duration {
+	// TODO: b/486197011 - Reduce the timeout.
+	return 60 * time.Second
+}
+
+// tcpMasq verifies Masquerade on TCP packets.
+type tcpMasq struct{ containerCase }
+
+var _ TestCase = (*tcpMasq)(nil)
+
+func (t *tcpMasq) setupClientNamespace() (func(), error) {
+	if err := runCmd("ip", "netns", "add", "client_ns"); err != nil {
+		return nil, err
+	}
+	cleanup := func() {
+		runCmd("ip", "netns", "del", "client_ns")
+	}
+
+	cmds := [][]string{
+		{"ip", "link", "add", "veth-router", "type", "veth", "peer", "name", "veth-client"},
+		{"ip", "link", "set", "veth-client", "netns", "client_ns"},
+		{"ip", "addr", "add", "192.168.1.1/24", "dev", "veth-router"},
+		{"ip", "link", "set", "veth-router", "up"},
+		{"ip", "-n", "client_ns", "addr", "add", "192.168.1.2/24", "dev", "veth-client"},
+		{"ip", "-n", "client_ns", "link", "set", "veth-client", "up"},
+		{"ip", "-n", "client_ns", "link", "set", "lo", "up"},
+		{"ip", "-n", "client_ns", "route", "replace", "default", "via", "192.168.1.1", "dev", "veth-client"},
+	}
+
+	for _, cmd := range cmds {
+		if err := runCmd(cmd[0], cmd[1:]...); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+
+	return cleanup, nil
+}
+
+// acceptSync listens on the specified port with a timeout,
+// and calls the handle function on the connection.
+func acceptSync(ip net.IP, port string, timeout time.Duration, handle func(net.Conn) error) error {
+	l, err := net.Listen("tcp", net.JoinHostPort(ip.String(), port))
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+
+		if handle != nil {
+			errCh <- handle(conn)
+		} else {
+			errCh <- nil
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("timeout waiting for sync connection on %s", port)
+	}
+}
+
+// dialSync attempts to connect to the specified IP and port,
+// and calls the handle function on the connection.
+func dialSync(ip net.IP, port string, retries int, handle func(net.Conn) error) error {
+	dialAddr := net.JoinHostPort(ip.String(), port)
+	var lastErr error
+	for i := 0; i < retries; i++ {
+		conn, err := net.DialTimeout("tcp", dialAddr, 2*time.Second)
+		if err == nil {
+			defer conn.Close()
+			if handle != nil {
+				return handle(conn)
+			}
+			return nil
+		}
+		lastErr = err
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("failed to connect to %s after %d attempts: %v", dialAddr, retries, lastErr)
+}
+
+func (*tcpMasq) Name() string {
+	return "tcpMasq"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+// Setup a client namespace and NAT masq TCP rules.
+// Enable IP forwarding.
+// Generate traffic from namespace to trigger NAT masq.
+func (t *tcpMasq) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		log.Warningf("Masq is not supported for IPv6 yet.")
+		return nil
+	}
+
+	targetIface, ok := netutils.GetNonLoopbackInterface()
+	if !ok {
+		return fmt.Errorf("no non-loopback interface found")
+	}
+
+	// Setup namespace and veth pair.
+	// When a packet is sent from the namespace, NAT masq should replace the
+	// source IP address (namespace IP) to the container's IP.
+
+	cleanup, err := t.setupClientNamespace()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Enable IP forwarding.
+	if err := runCmd("sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"); err != nil {
+		return err
+	}
+
+	// Sync setup with LocalAction and get the target port.
+	// This is to avoid port in use issues.
+	var remotePort int
+
+	if err := acceptSync(net.ParseIP("0.0.0.0"), "8995", 15*time.Second, func(conn net.Conn) error {
+		if _, err := fmt.Fscanf(conn, "%d", &remotePort); err != nil {
+			return fmt.Errorf("failed to read target port: %v", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	log.Infof("tcpMasq: Sync with LocalAction successful, got remote port: %d", remotePort)
+
+	// Install NFTable rules.
+	{
+		cmds := [][]string{
+			{"add", "table", "inet", "nat"},
+			// Postrouting hook is required for masquerade.
+			{"add", "chain", "inet", "nat", "postrouting", "{ type nat hook postrouting priority 100; }"},
+			// Masq outgoing TCP traffic to remotePort on the target interface to custom port range.
+			{"add", "rule", "inet", "nat", "postrouting", "meta", "oifname", targetIface.Name, "tcp",
+				"dport", fmt.Sprintf("%d", remotePort), "counter", "masquerade", "to", ":10000-10005"},
+		}
+
+		for _, cmd := range cmds {
+			if err := nftCmd(cmd); err != nil {
+				return fmt.Errorf("nft cmd: %v, failed with error: %v", cmd, err)
+			}
+		}
+		log.Infof("tcpMasq: NFT rules installed successfully")
+	}
+
+	// Generate traffic from namespace to trigger masquerade.
+	{
+		dialAddr := ip.String()
+		log.Infof("tcpMasq: Generating traffic from namespace to %s:%d", dialAddr, remotePort)
+
+		// Wait a bit for forwarding to settle.
+		time.Sleep(1 * time.Second)
+
+		// Send TCP packet through nc inside client_ns.
+		// Ignore safetext/shsprintf linter suggestion.
+		bashCmd := fmt.Sprintf("echo remote_test | nc -v -w 5 %s %d", dialAddr, remotePort)
+		var lastErr error
+		for i := 0; i < 5; i++ {
+			lastErr = runCmd("ip", "netns", "exec", "client_ns", "bash", "-c", bashCmd)
+			if lastErr == nil {
+				break
+			}
+			log.Warningf("tcpMasq: Attempt %d to send traffic failed: %v", i+1, lastErr)
+			time.Sleep(1 * time.Second)
+		}
+
+		if lastErr != nil {
+			return fmt.Errorf("failed to generate traffic from namespace after retries: %v", lastErr)
+		}
+		log.Infof("tcpMasq: Traffic generated successfully")
+	}
+
+	return nil
+}
+
+// LocalAction implements TestCase.LocalAction.
+// Setup a TCP server to listen on dynamic port (to avoid port reuse issues).
+// Share the port with ContainerAction and verify the masq IP.
+func (*tcpMasq) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	if ipv6 {
+		return nil
+	}
+
+	// Listen on dynamic port to accept connections from container.
+	log.Infof("tcpMasq (LocalAction): Listening on dynamic port")
+	l, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		return fmt.Errorf("net.Listen failed: %v", err)
+	}
+	defer l.Close()
+	pickedPort := l.Addr().(*net.TCPAddr).Port
+	log.Infof("tcpMasq (LocalAction): Picked port %d", pickedPort)
+
+	// Sync with ContainerAction setup and share the picked port.
+	{
+		log.Infof("tcpMasq (LocalAction): Waiting for container sync on port 8995...")
+		if err := dialSync(ip, "8995", 10, func(conn net.Conn) error {
+			_, err := fmt.Fprintf(conn, "%d\n", pickedPort)
+			return err
+		}); err != nil {
+			return fmt.Errorf("sync dial failed: %v", err)
+		}
+		log.Infof("tcpMasq (LocalAction): Sync successful")
+	}
+
+	// Verify that the connection is established and
+	// 1. the remote address is the container's main IP
+	// 2. the remote port is in the masq range
+	{
+		errCh := make(chan error, 1)
+		go func() {
+			conn, err := l.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer conn.Close()
+			log.Infof("tcpMasq (LocalAction): Accepted connection from %s", conn.RemoteAddr())
+
+			// Assert that the remote port is in the masq range.
+			remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+			if remoteAddr.Port < 10000 || remoteAddr.Port > 10005 {
+				errCh <- fmt.Errorf("unexpected remote port: %d, expected range 10000-10005", remoteAddr.Port)
+				return
+			}
+
+			// Assert that the remote IP is the container's IP and not the namespace IP.
+			if remoteAddr.IP.String() != ip.String() {
+				errCh <- fmt.Errorf("unexpected remote IP: %s, expected %s", remoteAddr.IP.String(), ip.String())
+				return
+			}
+			errCh <- nil
+		}()
+
+		// Wait for connection or timeout.
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return err
+			}
+			log.Infof("tcpMasq (LocalAction): Successfully handled connection")
+		case <-time.After(30 * time.Second):
+			return fmt.Errorf("timeout waiting for the client connection")
+		}
+	}
+
+	return nil
+}
+
+// Timeout implements TestCase.Timeout.
+func (*tcpMasq) Timeout() time.Duration {
 	return 30 * time.Second
 }

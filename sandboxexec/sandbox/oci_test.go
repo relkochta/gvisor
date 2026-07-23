@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sandbox
+package sandbox_test
 
 import (
 	"encoding/json"
@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
 
 func TestNewBundle(t *testing.T) {
@@ -29,19 +30,20 @@ func TestNewBundle(t *testing.T) {
 		t.Run(t.Name(), func(t *testing.T) {
 			tempDir := t.TempDir()
 			sandboxID := "test-sandbox"
-
-			bundleDir, err := NewBundle(sandboxID, tempDir, enableNetworking)
+			bundleDir, err := sandbox.NewBundle(sandbox.BundleConfig{
+				ID:               sandboxID,
+				RuntimeDir:       tempDir,
+				EnableNetworking: enableNetworking,
+			})
 			if err != nil {
 				t.Fatalf("NewBundle(enableNet=%v) failed: %v", enableNetworking, err)
 			}
 			defer os.RemoveAll(bundleDir)
-
 			expectedBundleDir := filepath.Join(tempDir, sandboxID)
 			if bundleDir != expectedBundleDir {
 				t.Fatalf("NewBundle(%v, %v) = %q, want %q", sandboxID, tempDir, bundleDir, expectedBundleDir)
 			}
 
-			// Verify config.json was created and contains valid OCI spec.
 			configPath := filepath.Join(bundleDir, "config.json")
 			configFile, err := os.Open(configPath)
 			if err != nil {
@@ -59,6 +61,9 @@ func TestNewBundle(t *testing.T) {
 			}
 			if spec.Root == nil || spec.Root.Path != "rootfs" {
 				t.Errorf("spec.Root.Path is not 'rootfs', got: %+v", spec.Root)
+			}
+			if spec.Root.Readonly {
+				t.Errorf("spec.Root.Readonly is true, want false")
 			}
 			if spec.Linux == nil {
 				t.Fatalf("spec.Linux is nil")
@@ -94,5 +99,171 @@ func TestNewBundle(t *testing.T) {
 				t.Errorf("enableNetworking=%v: spec.Linux.Namespaces=%+v, want: %+v", enableNetworking, spec.Linux.Namespaces, expectedNamespaces)
 			}
 		})
+	}
+}
+
+func TestNewBundleNormalization(t *testing.T) {
+	tempDir := t.TempDir()
+	sandboxID := "test-sandbox"
+
+	mounts := []sandbox.Mount{
+		{
+			Source:      "/tmp/foo/../bar",
+			Destination: "/mnt/foo/./bar",
+			Type:        sandbox.MountTypeBind,
+		},
+		{
+			Destination: "/mnt/baz/..",
+			Type:        sandbox.MountTypeTmpfs,
+		},
+	}
+
+	bundleDir, err := sandbox.NewBundle(sandbox.BundleConfig{
+		ID:         sandboxID,
+		RuntimeDir: tempDir,
+		Mounts:     mounts,
+	})
+	if err != nil {
+		t.Fatalf("NewBundle failed: %v", err)
+	}
+	defer os.RemoveAll(bundleDir)
+
+	configPath := filepath.Join(bundleDir, "config.json")
+	configFile, err := os.Open(configPath)
+	if err != nil {
+		t.Fatalf("failed to open config.json: %v", err)
+	}
+	defer configFile.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(configFile).Decode(&spec); err != nil {
+		t.Fatalf("failed to decode config.json: %v", err)
+	}
+
+	var foundBind, foundTmpfs bool
+	for _, m := range spec.Mounts {
+		if m.Type == "bind" && m.Destination == "/mnt/foo/bar" {
+			foundBind = true
+			if m.Source != "/tmp/bar" {
+				t.Errorf("bind source = %q, want %q", m.Source, "/tmp/bar")
+			}
+		}
+		if m.Type == "tmpfs" && m.Destination == "/mnt" {
+			foundTmpfs = true
+		}
+	}
+
+	if !foundBind {
+		t.Errorf("failed to find normalized bind mount '/mnt/foo/bar'")
+	}
+	if !foundTmpfs {
+		t.Errorf("failed to find normalized tmpfs mount '/mnt'")
+	}
+}
+
+func TestNewBundleWithAnnotations(t *testing.T) {
+	tempDir := t.TempDir()
+	sandboxID := "test-sandbox-annotations"
+	annotations := map[string]string{
+		"dev.gvisor.tar.rootfs.upper": "/tmp/test.tar",
+	}
+	bundleDir, err := sandbox.NewBundle(sandbox.BundleConfig{
+		ID:          sandboxID,
+		RuntimeDir:  tempDir,
+		Annotations: annotations,
+	})
+	if err != nil {
+		t.Fatalf("NewBundle failed: %v", err)
+	}
+	defer os.RemoveAll(bundleDir)
+
+	configPath := filepath.Join(bundleDir, "config.json")
+	configFile, err := os.Open(configPath)
+	if err != nil {
+		t.Fatalf("failed to open config.json: %v", err)
+	}
+	defer configFile.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(configFile).Decode(&spec); err != nil {
+		t.Fatalf("failed to decode config.json: %v", err)
+	}
+
+	if val, ok := spec.Annotations["dev.gvisor.tar.rootfs.upper"]; !ok || val != "/tmp/test.tar" {
+		t.Errorf("expected annotation 'dev.gvisor.tar.rootfs.upper' with value '/tmp/test.tar', got spec.Annotations: %+v", spec.Annotations)
+	}
+}
+
+func TestNewBundleEnv(t *testing.T) {
+	tempDir := t.TempDir()
+	sandboxID := "test-sandbox-env"
+
+	env := []string{"TEST_VAR=A", "TEST_VAR=B"}
+
+	bundleDir, err := sandbox.NewBundle(sandbox.BundleConfig{
+		ID:         sandboxID,
+		RuntimeDir: tempDir,
+		Env:        env,
+	})
+	if err != nil {
+		t.Fatalf("NewBundle failed: %v", err)
+	}
+	defer os.RemoveAll(bundleDir)
+
+	configPath := filepath.Join(bundleDir, "config.json")
+	configFile, err := os.Open(configPath)
+	if err != nil {
+		t.Fatalf("failed to open config.json: %v", err)
+	}
+	defer configFile.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(configFile).Decode(&spec); err != nil {
+		t.Fatalf("failed to decode config.json: %v", err)
+	}
+
+	expectedEnv := []string{
+		"PATH=/bin:/usr/bin:/usr/local/bin",
+		"TEST_VAR=A",
+		"TEST_VAR=B",
+	}
+
+	// Verify default env vars
+	if !slices.Equal(spec.Process.Env, expectedEnv) {
+		t.Errorf("spec.Process.Env = %+v, want %+v", spec.Process.Env, expectedEnv)
+	}
+}
+
+func TestNewBundleWorkingDir(t *testing.T) {
+	tempDir := t.TempDir()
+	sandboxID := "test-sandbox-cwd"
+
+	customCwd := "/custom/absolute/path"
+
+	bundleDir, err := sandbox.NewBundle(sandbox.BundleConfig{
+		ID:         sandboxID,
+		RuntimeDir: tempDir,
+		WorkingDir: customCwd,
+	})
+
+	if err != nil {
+		t.Fatalf("NewBundle failed: %v", err)
+	}
+	defer os.RemoveAll(bundleDir)
+
+	configPath := filepath.Join(bundleDir, "config.json")
+	configFile, err := os.Open(configPath)
+	if err != nil {
+		t.Fatalf("failed to open config.json: %v", err)
+	}
+	defer configFile.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(configFile).Decode(&spec); err != nil {
+		t.Fatalf("failed to decode config.json: %v", err)
+	}
+
+	if spec.Process.Cwd != customCwd {
+		t.Errorf("spec.Process.Cwd = %q, want %q", spec.Process.Cwd, customCwd)
 	}
 }

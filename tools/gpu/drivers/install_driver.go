@@ -66,6 +66,27 @@ type Installer struct {
 	installFunc          func(string) error
 }
 
+func latestInstallableDriver() (nvconf.DriverVersion, error) {
+	var latest nvconf.DriverVersion
+	var found bool
+	nvproxy.ForEachSupportDriver(func(version nvconf.DriverVersion, checksums nvproxy.Checksums) {
+		checksum, err := checksums.Checksum()
+		if err != nil {
+			return
+		}
+		if checksum != nvproxy.ChecksumNoDriver && checksum != "" {
+			if version.IsGreaterThan(latest) {
+				latest = version
+				found = true
+			}
+		}
+	})
+	if !found {
+		return nvconf.DriverVersion{}, fmt.Errorf("no installable driver found for arch %q", runtime.GOARCH)
+	}
+	return latest, nil
+}
+
 // NewInstaller returns a driver installer instance.
 func NewInstaller(requestedVersion string, latest bool) (*Installer, error) {
 
@@ -77,7 +98,11 @@ func NewInstaller(requestedVersion string, latest bool) (*Installer, error) {
 	}
 	switch {
 	case latest:
-		ret.requestedVersion = nvproxy.LatestDriver()
+		version, err := latestInstallableDriver()
+		if err != nil {
+			return nil, err
+		}
+		ret.requestedVersion = version
 	default:
 		d, err := nvconf.DriverVersionFrom(requestedVersion)
 		if err != nil {
@@ -342,9 +367,9 @@ func tryToPrintFailureLogs() {
 // ValidateChecksum validates the checksum of the driver.
 func ValidateChecksum(ctx context.Context, version string, checksums nvproxy.Checksums) error {
 	for _, arch := range []string{archAMD64, archARM64} {
-		wantChecksum := checksums.X86_64()
+		wantChecksum := checksums.X86_64
 		if arch == archARM64 {
-			wantChecksum = checksums.Arm64()
+			wantChecksum = checksums.ARM64
 		}
 		installer, err := NewInstaller(version, false)
 		if err != nil {

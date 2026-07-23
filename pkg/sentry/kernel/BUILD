@@ -88,6 +88,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "cgroup_v2_mutex",
+    out = "cgroup_v2_mutex.go",
+    package = "kernel",
+    prefix = "cgroup2",
+)
+
+declare_mutex(
     name = "fd_table_mutex",
     out = "fd_table_mutex.go",
     package = "kernel",
@@ -251,13 +258,16 @@ go_library(
         "atomicptr_bucket_unsafe.go",
         "atomicptr_descriptor_unsafe.go",
         "cgroup.go",
+        "cgroup2.go",
         "cgroup_mounts_mutex.go",
         "cgroup_mutex.go",
+        "cgroup_v2_mutex.go",
         "context.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
         "fd_table_unsafe.go",
+        "file_hash.go",
         "fs_context.go",
         "fs_context_mutex.go",
         "fs_context_refs.go",
@@ -354,6 +364,7 @@ go_library(
         "//pkg/coverage",
         "//pkg/cpuid",
         "//pkg/devutil",
+        "//pkg/ebpf",
         "//pkg/errors",
         "//pkg/errors/linuxerr",
         "//pkg/eventchannel",
@@ -378,6 +389,7 @@ go_library(
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsimpl/mqfs",
         "//pkg/sentry/fsimpl/nsfs",
+        "//pkg/sentry/fsimpl/overlay",
         "//pkg/sentry/fsimpl/pipefs",
         "//pkg/sentry/fsimpl/sockfs",
         "//pkg/sentry/fsimpl/timerfd",

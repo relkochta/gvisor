@@ -83,6 +83,7 @@ def _syscall_test(
         netstack_sr = False,
         nftables = False,
         kvm_use_cpu_nums = True,
+        mount_cgroup_v2 = False,
         **kwargs):
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
@@ -183,6 +184,11 @@ def _syscall_test(
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
     ]
 
+    if mount_cgroup_v2:
+        runner_args.append("--mount-cgroup-v2=true")
+    else:
+        runner_args.append("--mount-cgroup-v2=false")
+
     # Trace points are platform agnostic, so enable them for ptrace only.
     if platform == "ptrace":
         runner_args.append("--trace")
@@ -228,6 +234,7 @@ def syscall_test_variants(
         netstack_sr = False,
         nftables = False,
         kvm_use_cpu_nums = False,
+        mount_cgroup_v2 = False,
         **kwargs):
     """Generates syscall tests for all variants.
 
@@ -285,6 +292,7 @@ def syscall_test_variants(
             netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
 
@@ -311,11 +319,13 @@ def syscall_test_variants(
             netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
 
-    # TODO(b/192114729): hostinet is not supported with S/R.
-    if add_hostinet and not (save or save_resume):
+    # Connected host sockets do not survive restore, so the save tests are
+    # skipped and only the save_resume tests are generated.
+    if add_hostinet and not save:
         _syscall_test(
             test = test,
             platform = default_platform,
@@ -338,6 +348,7 @@ def syscall_test_variants(
             netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
     if not use_tmpfs:
@@ -364,6 +375,7 @@ def syscall_test_variants(
             netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
     if add_fusefs:
@@ -388,6 +400,7 @@ def syscall_test_variants(
             netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
 
@@ -416,6 +429,7 @@ def syscall_test(
         nftables = False,
         perf = False,
         kvm_use_cpu_nums = False,
+        mount_cgroup_v2 = False,
         **kwargs):
     """syscall_test is a macro that will create targets for all platforms.
 
@@ -474,6 +488,7 @@ def syscall_test(
             container = container,
             one_sandbox = one_sandbox,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
 
@@ -502,6 +517,7 @@ def syscall_test(
         netstack_sr = False,
         nftables = nftables,
         kvm_use_cpu_nums = kvm_use_cpu_nums,
+        mount_cgroup_v2 = mount_cgroup_v2,
         **kwargs
     )
 
@@ -534,6 +550,7 @@ def syscall_test(
             netstack_sr = False,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )
 
@@ -592,5 +609,6 @@ def syscall_test(
             netstack_sr = False,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
+            mount_cgroup_v2 = mount_cgroup_v2,
             **kwargs
         )

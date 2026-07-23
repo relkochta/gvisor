@@ -47,6 +47,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
@@ -261,6 +262,7 @@ type NFTables struct {
 	connTrack          *stack.ConnTrack                    // Conntrack object for tracking connections.
 	connTrackReaper    tcpip.Timer                         // Reaper timer for reaping timed out connections.
 	natEnabled         bool                                // Whether the nat module is enabled.
+	stack              *stack.Stack                        // Parent stack object.
 }
 
 // Ensures NFTables implements the NFTablesInterface.
@@ -306,6 +308,10 @@ type Table struct {
 	// flagSet is the set of optional flags for the table.
 	// Note: currently nftables only has the single Dormant flag.
 	flagSet map[TableFlag]struct{}
+
+	// sets is a map of sets for each table.
+	sets       map[string]*nftSet
+	setHandles map[uint64]*nftSet
 
 	// handleCounter is the counter for chain and rule handles.
 	handleCounter atomicbitops.Uint64
@@ -704,6 +710,18 @@ type ExprInfo struct {
 	ExprData nlmsg.AttrsView
 }
 
+type opCompatCtx struct {
+	chain *Chain
+}
+
+type opEvalCtx struct {
+	pkt      *stack.PacketBuffer
+	hook     stack.NFHook
+	rule     *Rule
+	route    *stack.Route
+	nftState *NFTables
+}
+
 // operation represents a single operation in a rule.
 type operation interface {
 	// GetExprName returns the name of the expression.
@@ -711,10 +729,15 @@ type operation interface {
 	// Dump dumps the parameters.
 	Dump() ([]byte, *syserr.AnnotatedError)
 
-	// evaluate evaluates the operation on the given packet and register set,
-	// changing the register set and possibly the packet in place. We pass the
-	// assigned rule to allow the operation to access parts of the NFTables state.
-	evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule)
+	evaluate(regs *registerSet, evalCtx opEvalCtx)
+
+	// checkCompatibility returns if the operation is compatible with the context
+	// it is being bound to. It is called during rule registration to verify
+	// that the operation's requirements are met by the NFTables execution context.
+	checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError
+
+	// deepCopy returns a deep copy of the operation.
+	deepCopy() operation
 }
 
 // Ensures all operations implement the Operation interface at compile time.
@@ -731,6 +754,12 @@ var (
 	_ operation = (*byteorder)(nil)
 	_ operation = (*metaLoad)(nil)
 	_ operation = (*metaSet)(nil)
+	_ operation = (*natOp)(nil)
+	_ operation = (*lookupOp)(nil)
+	_ operation = (*fib)(nil)
+	_ operation = (*ctGet)(nil)
+	_ operation = (*ctSet)(nil)
+	_ operation = (*masqOp)(nil)
 )
 
 // OpType represents the type of operation.
@@ -759,6 +788,14 @@ const (
 	OpTypeMeta
 	// OpTypeNAT is the NAT operation type.
 	OpTypeNAT
+	// OpTypeLookup is the lookup operation type.
+	OpTypeLookup
+	// OpTypeFIB is the FIB operation type.
+	OpTypeFIB
+	// OpTypeCT is the conntrack operation type.
+	OpTypeCT
+	// OpTypeMasq is the masquerade operation type.
+	OpTypeMasq
 	// OpTypeUnknown is the unknown operation type.
 	OpTypeUnknown
 )
@@ -775,6 +812,10 @@ var opTypeStrings = []string{
 	OpTypeByteorder:  "byteorder",
 	OpTypeMeta:       "meta",
 	OpTypeNAT:        "nat",
+	OpTypeLookup:     "lookup",
+	OpTypeFIB:        "fib",
+	OpTypeCT:         "ct",
+	OpTypeMasq:       "masq",
 	OpTypeUnknown:    "unknown",
 }
 
@@ -907,6 +948,127 @@ var netlinkAFToStackAF = map[uint8]stack.AddressFamily{
 	linux.NFPROTO_IPV6:   stack.IP6,
 }
 
+// NftSetBackend is an interface for handling set operations.
+type NftSetBackend interface {
+	// Evaluate returns the index of the element in the set if found, otherwise -1.
+	// keyIdx is the index of the key in the register set.
+	Evaluate(regs *registerSet, keyIdx int) int
+
+	// Find returns the index of the element given the raw key data, otherwise -1.
+	Find(key []byte) int
+
+	// Add inserts an element to the set and returns the insertion index.
+	// If the element already exists,
+	// it returns the index of the existing element.
+	Add(e *nftSetElem, idx int) (int, *syserr.AnnotatedError)
+
+	// Remove removes an element from the set and returns the index of the
+	// removed element.
+	// If the element does not exist, it returns -1.
+	Remove(e *nftSetElem) (int, *syserr.AnnotatedError)
+
+	// Clone returns a copy of the set backend.
+	Clone() NftSetBackend
+}
+
+// Set represents an nftables set.
+// Ref: include/net/netfilter/nf_tables.h:nft_set
+type nftSet struct {
+	// name represents the unique name for this set.
+	name string
+	// keyType represents the type of key; i.e. IPv4, IPv6, port, etc.
+	keyType uint32
+	// dataType represents the type of data; i.e. VERDICT or DATA.
+	dataType uint32
+	// objType represents the type of object that the set is storing.
+	objType uint32
+	// descSize represents the max number of elements.
+	// If 0, then the set has no bounds on the number of elements.
+	descSize uint32
+	// fieldLen represents the length of each sub-key.
+	fieldLen []uint8
+	// fieldCount represents the number of sub-keys.
+	fieldCount uint8
+	// bindings represents the list of lookupOps that use this set.
+	bindings []*lookupOp
+	// timeout represents the timeout for the elements in the set.
+	// TODO: b/505409691 - Add support for set timeout.
+	timeout uint64
+	// gcInterval represents the interval for garbage collection.
+	// GC gets rid of expired elements in the set.
+	// TODO: b/505409691 - Add support for gc interval.
+	gcInterval uint32
+	// policy passed by the user hints at
+	// whether the set should be memory or performance optimized.
+	// TODO: b/505409691 - Add support for set policy.
+	policy uint32
+	// udata represents the user data of the set.
+	udata []byte
+	// exprInfos represents the stateful nft expressions/ops;
+	// counter, limit, etc.
+	// that are directly associated with the individual set elements.
+	// TODO: b/505409691 - Add support for expressions other than the counters.
+	exprInfos []ExprInfo
+	// flags determines the set's configuration.
+	flags uint16
+	// dead marks the set as deleted.
+	dead uint8
+	// genmask links to nftables generation.
+	// We don't need to support this as we make a full copy of
+	// the set on each transaction; so each NFTables instance
+	// is it's own "generation".
+	genmask uint16
+	// keyLen is the length of the key,
+	// or the combined length of all the sub-keys.
+	keyLen uint8
+	// dataLen is the length of the data;
+	// incase of a verdict set, this is not required.
+	dataLen uint8
+	// handle is the NFTables unique identifier for this set.
+	handle uint64
+	// elements represents the stored key-value elements in the set.
+	elements []nftSetElem
+	// catchAllElem is a default element that is used when the key
+	// does not match any of the other elements.
+	catchAllElem *nftSetElem
+	// backend represents the backend object that handles the set operations.
+	backend NftSetBackend
+}
+
+// dataOrVerdict represents the data or verdict of the set element.
+type dataOrVerdict struct {
+	isVerdict bool
+	verdict   stack.NFVerdict
+	data      []byte
+}
+
+// nftSetElem represents an element in an nftables set.
+// Ref: include/net/netfilter/nf_tables.h:nft_set_elem
+type nftSetElem struct {
+	// startKey represents the lower bound key for the element.
+	// For a simple set, this is the key itself.
+	// For a set range, this is the lower bound of the range.
+	startKey []byte
+	// endKey represents the upper bound key for the element.
+	// Only required for ranged sets.
+	// TODO: b/505409691 - Add support for ranged sets.
+	endKey []byte
+	// data represents the data or verdict of the set element.
+	data dataOrVerdict
+	// ops represents the Nftables ops(counter, limit, etc.)
+	// that are associated with the set element.
+	ops []operation
+	// timeout represents the timeout for the element.
+	// TODO: b/505409691 - Add support for set element timeout.
+	timeout uint64
+	// expiration represents the expiration time of the element.
+	// TODO: b/505409691 - Add support for set element expiration.
+	expiration uint64
+	// userData represents the user data that can be associated with the element.
+	// It's only for the user to see and has no affect on the set element.
+	userData []byte
+}
+
 // AFtoNetlinkAF converts a generic address family to a netfilter address family.
 // On error, we simply cast it to be a stack.AddressFamily and return an error to allow netfilter
 // sockets to handle it accordingly if needed.
@@ -996,17 +1158,19 @@ func regNumToIdx(reg uint8, dataLenBytes int) (int, *syserr.AnnotatedError) {
 
 // formatRegIdxForDump formats the register index for the dump operation.
 // net/netfilter/nf_tables_api.c:nft_dump_register
-func formatRegIdxForDump(regIdx int) uint32 {
+func formatRegIdxForDump(regIdx int) marshal.Marshallable {
 	if regIdx >= registersByteSize {
-		return 0
+		return nlmsg.PutU32(0)
 	}
 	if regIdx%linux.NFT_REG_SIZE == 0 {
-		return uint32(regIdx/linux.NFT_REG_SIZE) + linux.NFT_REG_1
+		val := uint32(regIdx/linux.NFT_REG_SIZE) + linux.NFT_REG_1
+		return nlmsg.PutU32(val)
 	}
 	if regIdx%linux.NFT_REG32_SIZE != 0 {
-		return 0
+		return nlmsg.PutU32(0)
 	}
-	return uint32(regIdx/linux.NFT_REG32_SIZE) + linux.NFT_REG32_00
+	val := uint32(regIdx/linux.NFT_REG32_SIZE) + linux.NFT_REG32_00
+	return nlmsg.PutU32(val)
 }
 
 // validateVerdictData validates the verdict data bytes and returns the data as a verdict.
@@ -1075,17 +1239,17 @@ func validateVerdictData(tab *Table, bytes nlmsg.AttrsView) (stack.NFVerdict, *s
 
 // deepCopyRule returns a deep copy of the Rule struct.
 func deepCopyRule(rule *Rule, chainCopy *Chain) *Rule {
-	return &Rule{
-		chain: chainCopy,
-		// Because the underlying op data within the slice cannot be
-		// modified, creating a shallow copy is sufficient. Even if the
-		// original struct is modified and an operation is dropped,
-		// the copy will hold a reference to the original operation,
-		// preventing it from being destroyed.
-		ops:    slices.Clone(rule.ops),
+	ruleCopy := &Rule{
+		chain:  chainCopy,
 		handle: rule.handle,
 		udata:  slices.Clone(rule.udata),
 	}
+
+	ruleCopy.ops = make([]operation, 0, len(rule.ops))
+	for _, op := range rule.ops {
+		ruleCopy.ops = append(ruleCopy.ops, op.deepCopy())
+	}
+	return ruleCopy
 }
 
 // deepCopyChain returns a deep copy of the Chain struct.
@@ -1121,6 +1285,58 @@ func deepCopyChain(chain *Chain, tableCopy *Table) *Chain {
 	return chainCopy
 }
 
+func deepCopySetElement(elem *nftSetElem) *nftSetElem {
+	elemCopy := &nftSetElem{
+		startKey:   slices.Clone(elem.startKey),
+		endKey:     slices.Clone(elem.endKey),
+		data:       elem.data,
+		timeout:    elem.timeout,
+		expiration: elem.expiration,
+		ops:        make([]operation, 0, len(elem.ops)),
+		userData:   slices.Clone(elem.userData),
+	}
+	elemCopy.data.data = slices.Clone(elem.data.data)
+	for _, op := range elem.ops {
+		elemCopy.ops = append(elemCopy.ops, op.deepCopy())
+	}
+	return elemCopy
+}
+
+// deepCopySet returns a deep copy of the Set struct.
+func deepCopySet(set *nftSet, copyBindings bool) *nftSet {
+	setCopy := &nftSet{
+		name:       set.name,
+		keyType:    set.keyType,
+		dataType:   set.dataType,
+		objType:    set.objType,
+		descSize:   set.descSize,
+		fieldLen:   slices.Clone(set.fieldLen),
+		fieldCount: set.fieldCount,
+		timeout:    set.timeout,
+		gcInterval: set.gcInterval,
+		policy:     set.policy,
+		udata:      slices.Clone(set.udata),
+		exprInfos:  slices.Clone(set.exprInfos),
+		flags:      set.flags,
+		dead:       set.dead,
+		genmask:    set.genmask,
+		keyLen:     set.keyLen,
+		dataLen:    set.dataLen,
+		handle:     set.handle,
+		backend:    set.backend.Clone(),
+	}
+	if set.catchAllElem != nil {
+		setCopy.catchAllElem = deepCopySetElement(set.catchAllElem)
+	}
+	setCopy.elements = make([]nftSetElem, 0, len(set.elements))
+	for _, elem := range set.elements {
+		elemCopy := deepCopySetElement(&elem)
+		setCopy.elements = append(setCopy.elements, *elemCopy)
+	}
+
+	return setCopy
+}
+
 // deepCopyTable returns a deep copy of the Table struct.
 func deepCopyTable(table *Table, afFilter *addressFamilyFilter) *Table {
 	tableCopy := &Table{
@@ -1130,6 +1346,8 @@ func deepCopyTable(table *Table, afFilter *addressFamilyFilter) *Table {
 		chainHandles: make(map[uint64]*Chain),
 		flagSet:      make(map[TableFlag]struct{}),
 		handle:       table.handle,
+		sets:         make(map[string]*nftSet),
+		setHandles:   make(map[uint64]*nftSet),
 		owner:        table.owner,
 		userData:     slices.Clone(table.userData),
 	}
@@ -1139,11 +1357,30 @@ func deepCopyTable(table *Table, afFilter *addressFamilyFilter) *Table {
 		tableCopy.flagSet[flag] = struct{}{}
 	}
 
+	for setName, set := range table.sets {
+		// Bindings are updated in the rule deepCopy.
+		setCopy := deepCopySet(set, false /*=copyBindings*/)
+		tableCopy.sets[setName] = setCopy
+		tableCopy.setHandles[setCopy.handle] = setCopy
+	}
+
 	for chainName, chain := range table.chains {
 		chainCopy := deepCopyChain(chain, tableCopy)
 		tableCopy.chains[chainName] = chainCopy
 		tableCopy.chainHandles[chainCopy.handle] = chainCopy
+		// Update the set-bindings for lookup operations.
+		for _, ruleCopy := range chainCopy.rules {
+			for _, op := range ruleCopy.ops {
+				lookup, ok := op.(*lookupOp)
+				if !ok {
+					continue
+				}
+				lookup.set = tableCopy.sets[lookup.set.name]
+				lookup.set.bindings = append(lookup.set.bindings, lookup)
+			}
+		}
 	}
+
 	return tableCopy
 }
 
@@ -1162,6 +1399,7 @@ func (nf *NFTables) DeepCopy() *NFTables {
 		connTrack:          nf.connTrack,
 		connTrackReaper:    nf.connTrackReaper,
 		natEnabled:         nf.natEnabled,
+		stack:              nf.stack,
 	}
 
 	nftCopy.tableHandleCounter.Store(nf.tableHandleCounter.Load())

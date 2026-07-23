@@ -45,11 +45,10 @@ type pciDeviceFD struct {
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
 
-	// If hostFD is -1, this file descriptor has been restored from a save state,
-	// and should be treated as invalid. Any operations on this file descriptor
-	// will effectively be a no-op.
-	hostFD int32
-	queue  waiter.Queue
+	hostFD        int32
+	deviceAddress string
+	containerName string
+	queue         waiter.Queue
 
 	// TODO: pciDeviceFD.InvalidateUnsavable uses this state, but AFAIU
 	// pciDeviceFD.Translate will return the same File and offset after
@@ -59,6 +58,7 @@ type pciDeviceFD struct {
 	// +checklocks:mapsMu
 	mappings   memmap.MappingSet
 	memmapFile fsutil.MmapPreciseFile
+	tpuproxy   *tpuproxy
 }
 
 func (fd *pciDeviceFD) isRestored() bool {
@@ -67,6 +67,7 @@ func (fd *pciDeviceFD) isRestored() bool {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *pciDeviceFD) Release(context.Context) {
+	defer fd.tpuproxy.untrackFD(fd)
 	if fd.isRestored() {
 		return
 	}
@@ -286,6 +287,8 @@ func (fd *pciDeviceFD) vfioSetIrqs(ctx context.Context, t *kernel.Task, arg host
 		if _, err := primitive.CopyUint8SliceIn(t, arg, payload); err != nil {
 			return 0, err
 		}
+		// Prevent TOCTOU by overwriting the header with the validated values
+		irqSet.MarshalUnsafe(payload[:irqSet.SizeBytes()])
 		return util.IOCTLInvokePtrArg[uint32](fd.hostFD, linux.VFIO_DEVICE_SET_IRQS, &payload[0])
 	// VFIO_IRQ_SET_DATA_EVENTFD indicates that the data field is an array
 	// of int32 (or event file descriptors). These descriptors will be
@@ -296,6 +299,12 @@ func (fd *pciDeviceFD) vfioSetIrqs(ctx context.Context, t *kernel.Task, arg host
 		if _, err := primitive.CopyInt32SliceIn(t, arg, payload); err != nil {
 			return 0, err
 		}
+		// Prevent TOCTOU by overwriting the header with the validated values
+		payload[0] = int32(irqSet.Argsz)
+		payload[1] = int32(irqSet.Flags)
+		payload[2] = int32(irqSet.Index)
+		payload[3] = int32(irqSet.Start)
+		payload[4] = int32(irqSet.Count)
 		// Transform the input FDs to host FDs.
 		for i := 0; i < int(irqSet.Count); i++ {
 			index := len(payload) - 1 - i

@@ -663,14 +663,18 @@ func (h *handshake) transitionToStateEstablishedLocked(s *segment) {
 	// (indicated by a negative send window scale).
 	initSender(h.ep, h.iss, h.ackNum-1, h.sndWnd, h.mss, h.sndWndScale)
 
-	now := h.ep.stack.Clock().NowMonotonic()
+	// Use the final handshake ACK's ingress time (s.rcvdTime) rather than the
+	// current clock to seed the initial RTT/RTO. If the ACK was delayed inside
+	// the stack before processing, the processing-time clock would inflate the
+	// initial RTO, which then persists for several RTTs.
+	rcvd := s.rcvdTime
 
 	var rtt time.Duration
 	if h.ep.SendTSOk && s.parsedOptions.TSEcr != 0 {
-		rtt = h.ep.elapsed(now, s.parsedOptions.TSEcr)
+		rtt = h.ep.elapsed(rcvd, s.parsedOptions.TSEcr)
 	}
 	if !h.sampleRTTWithTSOnly && rtt == 0 {
-		rtt = now.Sub(h.startTime)
+		rtt = rcvd.Sub(h.startTime)
 	}
 
 	if rtt > 0 {
@@ -829,7 +833,10 @@ func (e *Endpoint) sendSynTCP(r *stack.Route, tf tcpFields, opts header.TCPSynOp
 	if r.NetProto() == header.IPv6ProtocolNumber && tf.expOptVal != 0 {
 		hdrSize += header.IPv6ExperimentHdrLength
 	}
-	p := stack.NewPacketBuffer(stack.PacketBufferOptions{ReserveHeaderBytes: hdrSize})
+	p := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: hdrSize,
+		Mark:               e.ops.GetMark(),
+	})
 	defer p.DecRef()
 	if err := e.sendTCP(r, tf, p, stack.GSO{}); err != nil {
 		e.stats.SendErrors.SynSendToNetworkFailed.Increment()
@@ -905,7 +912,10 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso sta
 				// Reserve extra bytes for the experiment option.
 				hdrSize += header.IPv6ExperimentHdrLength
 			}
-			splitPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{ReserveHeaderBytes: hdrSize})
+			splitPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				ReserveHeaderBytes: hdrSize,
+				Mark:               pkt.Mark,
+			})
 			splitPkt.Data().ReadFromPacketData(pkt.Data(), packetSize)
 			pkt = splitPkt
 		}
@@ -1013,7 +1023,9 @@ func (e *Endpoint) makeOptions(sackBlocks []header.SACKBlock) []byte {
 //
 // +checklocks:e.mu
 func (e *Endpoint) sendEmptyRaw(flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{})
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Mark: e.ops.GetMark(),
+	})
 	defer pkt.DecRef()
 	return e.sendRaw(pkt, flags, seq, ack, rcvWnd)
 }

@@ -61,11 +61,18 @@ func newMetaLoad(key metaKey, dreg uint8) (*metaLoad, *syserr.AnnotatedError) {
 	return &metaLoad{key: key, dregIdx: dregIdx}, nil
 }
 
-// evaluate for MetaLoad loads specific meta data into the destination register.
-func (op metaLoad) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule) {
-	var target []byte
-	switch op.key {
+func (op *metaLoad) deepCopy() operation {
+	opCopy := *op
+	return &opCopy
+}
 
+// evaluate for MetaLoad loads specific meta data into the destination register.
+func (op metaLoad) evaluate(regs *registerSet, evalCtx opEvalCtx) {
+	var target []byte
+	pkt := evalCtx.pkt
+	rule := evalCtx.rule
+
+	switch op.key {
 	// Packet Length, in bytes (32-bit, host order).
 	case linux.NFT_META_LEN:
 		target = binary.NativeEndian.AppendUint32(nil, uint32(pkt.Size()))
@@ -150,6 +157,26 @@ func (op metaLoad) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Ru
 		now := clock.Now()
 		secs := now.Hour()*3600 + now.Minute()*60 + now.Second()
 		target = binary.NativeEndian.AppendUint32(nil, uint32(secs))
+
+	// Output Interface Name (string, host order).
+	case linux.NFT_META_OIFNAME:
+		dst := regs.data[op.dregIdx:]
+		clear(dst[:linux.IFNAMSIZ])
+		if evalCtx.route != nil {
+			nic := evalCtx.route.OutgoingNIC()
+			name := evalCtx.nftState.stack.FindNICNameFromID(nic)
+			copy(dst, name)
+		}
+		return
+
+	// Input Interface Name (string, host order).
+	case linux.NFT_META_IIFNAME:
+		nic := pkt.InputNICID
+		name := evalCtx.nftState.stack.FindNICNameFromID(nic)
+		dst := regs.data[op.dregIdx:]
+		clear(dst[:linux.IFNAMSIZ])
+		copy(dst, name)
+		return
 	}
 
 	// Breaks if could not retrieve meta data.
@@ -177,8 +204,13 @@ func (op metaLoad) GetExprName() string {
 func (op metaLoad) Dump() ([]byte, *syserr.AnnotatedError) {
 	m := &nlmsg.Message{}
 	m.PutAttr(linux.NFTA_META_KEY, nlmsg.PutU32(uint32(op.key)))
-	m.PutAttr(linux.NFTA_META_DREG, nlmsg.PutU32(formatRegIdxForDump(op.dregIdx)))
+	m.PutAttr(linux.NFTA_META_DREG, formatRegIdxForDump(op.dregIdx))
 	return m.Buffer(), nil
+}
+
+// checkCompatibility implements operation.checkCompatibility.
+func (op metaLoad) checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError {
+	return nil
 }
 
 func initMetaLoad(attrs map[uint16]nlmsg.BytesView) (*metaLoad, *syserr.AnnotatedError) {

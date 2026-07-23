@@ -261,6 +261,10 @@ func TestFilterOutputInvertUIDAndGIDOwner(t *testing.T) {
 	singleTest(t, &FilterOutputInvertUIDAndGIDOwner{})
 }
 
+func TestFilterOutputOwnerNilAccept(t *testing.T) {
+	singleTest(t, &FilterOutputOwnerNilAccept{})
+}
+
 func TestFilterOutputInterfaceAccept(t *testing.T) {
 	singleTest(t, &FilterOutputInterfaceAccept{})
 }
@@ -514,4 +518,20 @@ func TestFilterOutputDropSrcPorts(t *testing.T) {
 
 func TestFilterOutputAcceptInvertPorts(t *testing.T) {
 	singleTest(t, &FilterOutputAcceptInvertPorts{})
+}
+
+func TestFilterInputRejectDefault(t *testing.T) {
+	singleTest(t, &FilterInputRejectDefault{})
+}
+
+func TestFilterInputRejectDefaultUnmatched(t *testing.T) {
+	singleTest(t, &FilterInputRejectDefaultUnmatched{})
+}
+
+func TestFilterInputRejectTCPReset(t *testing.T) {
+	singleTest(t, &FilterInputRejectTCPReset{})
+}
+
+func TestFilterInputRejectTCPResetUnmatched(t *testing.T) {
+	singleTest(t, &FilterInputRejectTCPResetUnmatched{})
 }

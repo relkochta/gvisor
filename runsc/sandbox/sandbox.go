@@ -60,10 +60,10 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/cgroup"
-	"gvisor.dev/gvisor/runsc/checkpointgofer"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/hostsettings"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -464,7 +464,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 		return err
 	}
 	// Configure the network.
-	if err := setupNetwork(conn, pid, conf, disableIPv6); err != nil {
+	if err := setupNetwork(conn, pid, conf, disableIPv6, false); err != nil {
 		return fmt.Errorf("setting up network: %w", err)
 	}
 
@@ -572,14 +572,17 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		if err != nil {
 			return err
 		}
-		// Configure the network.
-		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6); err != nil {
+		// Scrape the host network to get the network config and store it in the
+		// loader. The kernel will restore loaded network stack with this config.
+		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
 			return fmt.Errorf("setting up network: %w", err)
 		}
 	} else {
-		log.Debugf("Setting up network, config: %+v", networkArgs)
-		if err := conn.Call(boot.ContMgrCreateLinksAndRoutes, networkArgs, nil); err != nil {
-			return fmt.Errorf("creating links and routes: %w", err)
+		// When network args is not nil, set it in the loader which will be used
+		// during restore to configure the loaded stack.
+		log.Debugf("Setting up network args, config: %+v", networkArgs)
+		if err := conn.Call(boot.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+			return fmt.Errorf("setting network args: %w", err)
 		}
 	}
 
@@ -1030,7 +1033,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		donations.DonateAndClose("fs-restore-fds", files...)
 	}
 
-	if err := s.createSandboxProcessExtra(conf, args, cmd, &donations); err != nil {
+	if err := s.maybeConfigureSandboxProcessForWorkloadTriggerSave(conf, args, cmd, &donations); err != nil {
+		return err
+	}
+	if err := s.maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf, args, cmd, &donations); err != nil {
 		return err
 	}
 
@@ -1046,7 +1052,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
 	// isn't set.
-	if conf.Platform == "kvm" {
+	if conf.Platform == "kvm" || conf.Platform == "slimvm" {
 		cmd.Env = append(cmd.Env, "GODEBUG=asyncpreemptoff=1")
 	}
 
@@ -1741,6 +1747,9 @@ type FSSaveOpts struct {
 	// is successful. This is equivalent to !CheckpointOpts.Resume, and is
 	// provided for parity with that feature.
 	ExitAfterSaving bool
+
+	// Path is the path inside the container to save.
+	Path string
 }
 
 // FSSave sends the filesystem checkpointing call to the sandbox.
@@ -1749,6 +1758,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 	args := boot.FSSaveArgs{
 		ExitAfterSaving: opts.ExitAfterSaving,
+		Path:            opts.Path,
 	}
 	defer func() {
 		for _, f := range args.FilePayload.Files {
@@ -1921,7 +1931,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 		// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
 		// v1.service.newCommand()).
 		env := slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, "GOMAXPROCS=") })
-		_, err := checkpointgofer.ForkExec(checkpointgofer.Options{
+		_, err := gvisorbinaries.CheckpointGofer.ForkExec(gvisorbinaries.Options{
 			Argv:  argv,
 			Envv:  env,
 			Files: extraFiles,
@@ -1938,6 +1948,66 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 		return nil, fmt.Errorf("failed to start checkpoint gofer: %w", err)
 	}
 	return clientSockFile, nil
+}
+
+func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *config.Config, args *Args, cmd *exec.Cmd, donations *donation.Agency) error {
+	path, err := boot.GetAnnotationCheckpointPath(conf, args.Spec)
+	if err != nil {
+		return err
+	}
+	if len(path) == 0 {
+		// Annotation is empty or non-existent, nothing else to do.
+		return nil
+	}
+
+	comp, err := boot.GetAnnotationCheckpointCompression(args.Spec)
+	if err != nil {
+		return err
+	}
+	direct := boot.GetAnnotationCheckpointDirect(args.Spec)
+
+	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, path, "-allow-checkpoint-writes")
+	if err != nil {
+		return err
+	}
+	if clientSockFile != nil {
+		donations.DonateAndClose("save-fds", clientSockFile)
+		cmd.Args = append(cmd.Args, "-save-checkpoint-gofer")
+		log.Infof("Enabling workload-trigger saving to GCS via checkpoint gofer")
+	} else {
+		files, err := createSaveFiles(path, direct, comp)
+		if err != nil {
+			return fmt.Errorf("failed to create auto save files: %w", err)
+		}
+		donations.DonateAndClose("save-fds", files...)
+	}
+
+	return nil
+}
+
+func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *config.Config, args *Args, cmd *exec.Cmd, donations *donation.Agency) error {
+	path := boot.GetAnnotationFSCheckpointPath(args.Spec)
+	if len(path) == 0 {
+		return nil
+	}
+
+	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, path, "-allow-fscheckpoint-writes")
+	if err != nil {
+		return err
+	}
+	if clientSockFile != nil {
+		donations.DonateAndClose("fs-save-fds", clientSockFile)
+		cmd.Args = append(cmd.Args, "-fs-save-checkpoint-gofer")
+		log.Infof("Enabling workload-trigger filesystem checkpoint saving to GCS via checkpoint gofer")
+	} else {
+		files, err := openFSCheckpointLocalFiles(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, boot.GetAnnotationFSCheckpointDirect(args.Spec))
+		if err != nil {
+			return fmt.Errorf("failed to create auto fs save files: %w", err)
+		}
+		donations.DonateAndClose("fs-save-fds", files...)
+	}
+
+	return nil
 }
 
 // Pause sends the pause call for a container in the sandbox.
@@ -2463,6 +2533,21 @@ func (s *Sandbox) TarRootfsUpperLayer(containerID string, outFD *os.File) error 
 	}
 	if err := s.call(boot.FsTarRootfsUpperLayer, &opts, nil); err != nil {
 		return fmt.Errorf("serializing rootfs upper layer to tar: %w", err)
+	}
+	return nil
+}
+
+// ReadFile reads a file of the sandbox from the given container (or root container if containerID is empty) up to the specified size.
+func (s *Sandbox) ReadFile(containerID, path string, size int64, outFD *os.File) error {
+	log.Debugf("ReadFile, sandbox: %q, container: %q, path: %q, size: %d", s.ID, containerID, path, size)
+	opts := control.ReadOpts{
+		ContainerID: containerID,
+		Path:        path,
+		Size:        size,
+		FilePayload: urpc.FilePayload{Files: []*os.File{outFD}},
+	}
+	if err := s.call(boot.FsRead, &opts, nil); err != nil {
+		return fmt.Errorf("reading file %q: %w", path, err)
 	}
 	return nil
 }

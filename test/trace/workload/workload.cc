@@ -29,16 +29,19 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <csignal>
 #include <cstdio>
-#include <iostream>
-#include <ostream>
+#include <cstring>
+#include <string>
+#include <utility>
 
+#include "absl/base/macros.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
@@ -47,7 +50,38 @@
 namespace gvisor {
 namespace testing {
 
+// runForkExecve triggers a ForkAndExec process which results in the execution
+// of an execve() syscall by Sentry. It executes a symlink, which creates an
+// execution point with distinct properties for binary execution paths to
+// validate.
 void runForkExecve() {
+  // trace_test.go's checkSentryExec/checkSyscallExecve validates these specific
+  // distinct execution properties for this function path:
+
+  // 1. BinaryPath: Expects the fully resolved binary path -> /bin/true
+  symlink("/bin/true", "/tmp/test_symlink");
+
+  pid_t child;
+  int execve_errno;
+
+  // 2. Argv[0]: Expects the synthetic argument name -> "test_binary_name"
+  ExecveArray argv = {"test_binary_name"};
+  ExecveArray envv = {"TEST=123"};
+
+  // 3. Execfn: Expects the executing symlink path -> /tmp/test_symlink
+  auto kill_or_error = ForkAndExec("/tmp/test_symlink", argv, envv, nullptr,
+                                   &child, &execve_errno);
+  TEST_CHECK(execve_errno == 0);
+  // Don't kill child, just wait for gracefully exit.
+  kill_or_error.ValueOrDie().Release();
+  RetryEINTR(waitpid)(child, nullptr, 0);
+  unlink("/tmp/test_symlink");
+}
+
+// runForkExecveat triggers a ForkAndExecveat process using the "root_or_error"
+// directory file descriptor, which ultimately results in the execution
+// of an execveat() syscall by Sentry.
+void runForkExecveat() {
   auto root_or_error = Open("/", O_RDONLY, 0);
   auto& root = root_or_error.ValueOrDie();
 
@@ -57,7 +91,7 @@ void runForkExecve() {
   ExecveArray envv = {"TEST=123"};
   auto kill_or_error = ForkAndExecveat(root.get(), "/bin/true", argv, envv, 0,
                                        nullptr, &child, &execve_errno);
-  ASSERT_EQ(0, execve_errno);
+  TEST_CHECK(execve_errno == 0);
   // Don't kill child, just wait for gracefully exit.
   kill_or_error.ValueOrDie().Release();
   RetryEINTR(waitpid)(child, nullptr, 0);
@@ -93,7 +127,7 @@ void runSocket() {
     err(1, "fork");
   } else if (pid == 0) {
     // Child.
-    close(parent_sock);  // ensure it's not mistakely used in child.
+    close(parent_sock);  // ensure it's not mistakenly used in child.
 
     int server = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server < 0) {
@@ -667,6 +701,7 @@ void runInotifyRmWatch() {
 
 int main(int argc, char** argv) {
   ::gvisor::testing::runForkExecve();
+  ::gvisor::testing::runForkExecveat();
   ::gvisor::testing::runSocket();
   ::gvisor::testing::runReadWrite();
   ::gvisor::testing::runChdir();

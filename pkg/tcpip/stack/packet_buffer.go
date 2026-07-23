@@ -57,6 +57,9 @@ type PacketBufferOptions struct {
 	// OnRelease is a function to be run when the packet buffer is no longer
 	// referenced (released back to the pool).
 	OnRelease func()
+
+	// Mark is the mark value of this packet.
+	Mark uint32
 }
 
 // A PacketBuffer contains all the data of a network packet.
@@ -155,12 +158,19 @@ type PacketBuffer struct {
 	// NICID is the ID of the last interface the network packet was handled at.
 	NICID tcpip.NICID
 
+	// InputNICID is the ID of the interface that the network packet
+	// was received on.
+	InputNICID tcpip.NICID
+
 	// RXChecksumValidated indicates that checksum verification may be
 	// safely skipped.
 	RXChecksumValidated bool
 
 	// NetworkPacketInfo holds an incoming packet's network-layer information.
 	NetworkPacketInfo NetworkPacketInfo
+
+	// Mark is the mark value of this packet.
+	Mark uint32
 
 	tuple *tuple
 
@@ -183,6 +193,7 @@ func NewPacketBuffer(opts PacketBufferOptions) *PacketBuffer {
 	}
 	pk.NetworkPacketInfo.IsForwardedPacket = opts.IsForwardedPacket
 	pk.onRelease = opts.OnRelease
+	pk.Mark = opts.Mark
 	pk.InitRefs()
 	return pk
 }
@@ -381,6 +392,7 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	newPk.headers = pk.headers
 	newPk.Hash = pk.Hash
 	newPk.Owner = pk.Owner
+	newPk.Mark = pk.Mark
 	newPk.GSOOptions = pk.GSOOptions
 	newPk.EgressRoute = pk.EgressRoute
 	newPk.NetworkProtocolNumber = pk.NetworkProtocolNumber
@@ -389,6 +401,7 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	newPk.TransportProtocolNumber = pk.TransportProtocolNumber
 	newPk.PktType = pk.PktType
 	newPk.NICID = pk.NICID
+	newPk.InputNICID = pk.InputNICID
 	newPk.RXChecksumValidated = pk.RXChecksumValidated
 	newPk.NetworkPacketInfo = pk.NetworkPacketInfo
 	newPk.tuple = pk.tuple
@@ -432,6 +445,7 @@ func (pk *PacketBuffer) CloneToInbound() *PacketBuffer {
 	newPk.InitRefs()
 	// Treat unfilled header portion as reserved.
 	newPk.reserved = pk.AvailableHeaderBytes()
+	newPk.Mark = pk.Mark
 	newPk.tuple = pk.tuple
 	return newPk
 }
@@ -467,6 +481,7 @@ func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBu
 	}
 
 	newPk.tuple = pk.tuple
+	newPk.Mark = pk.Mark
 
 	return newPk
 }
@@ -474,6 +489,24 @@ func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBu
 // IsConnTrackConfigured returns whether connection tracking is configured for this packet.
 func (pk *PacketBuffer) IsConnTrackConfigured() bool {
 	return pk.tuple != nil && pk.tuple.conn != nil
+}
+
+// FillConnTrackInfo fills connection tracking information for the packet.
+func (pk *PacketBuffer) FillConnTrackInfo(opts ConnTrackInfoOpts, info *ConnTrackInfo) bool {
+	t := pk.tuple
+	if t == nil || t.conn == nil {
+		return false
+	}
+	return t.conn.FillConnTrackInfo(opts, info)
+}
+
+// IsReplyPacket returns whether the packet is a reply packet.
+func (pk *PacketBuffer) IsReplyPacket() bool {
+	t := pk.tuple
+	if t == nil {
+		return false
+	}
+	return t.reply
 }
 
 // IsNATConfigured returns whether NAT is configured for this packet.
@@ -501,6 +534,14 @@ func (pk *PacketBuffer) ConfigureNAT(portsOrIdents PortOrIdentRange, natAddress 
 		return false
 	}
 	return pk.tuple.conn.ConfigureNAT(portsOrIdents, natAddress, natType, changePort, changeAddress)
+}
+
+// ConfigureMasquerade configures NAT masquerade for the packet.
+func (pk *PacketBuffer) ConfigureMasquerade(portsOrIdents PortOrIdentRange, route *Route, stk *Stack, changePort bool) bool {
+	if !pk.IsConnTrackConfigured() {
+		return false
+	}
+	return pk.tuple.conn.configureMasquerade(pk, route, stk, portsOrIdents, changePort)
 }
 
 // FinalizeConnTrack finalizes the connection tracking state for the packet.
@@ -1108,6 +1149,11 @@ func (pk *PacketBuffer) CalculateTransportChecksum() {
 		xsum = header.PseudoHeaderChecksum(proto, src, dst, totalLen)
 		xsum = checksum.Combine(xsum, pk.Data().Checksum())
 		t.SetChecksum(0)
-		t.SetChecksum(^t.CalculateChecksum(xsum))
+		csum := ^t.CalculateChecksum(xsum)
+		// udp csum RFC 768.
+		if csum == 0 {
+			csum = 0xFFFF
+		}
+		t.SetChecksum(csum)
 	}
 }
