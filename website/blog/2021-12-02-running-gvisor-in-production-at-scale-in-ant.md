@@ -112,7 +112,7 @@ sandboxed applications.
 
 Here's the benchmark result on the structural cost of syscall. We got the data
 on a Intel(R) Xeon(R) CPU E5-2650 v2 platform, using
-[getpid benchmark](https://github.com/google/gvisor/blob/master/test/perf/linux/getpid_benchmark.cc).
+[getpid benchmark](https://github.com/relkochta/gvisor/blob/master/test/perf/linux/getpid_benchmark.cc).
 As we can see, for KVM platform, the syscall interception costs more than 10x
 than a native Linux syscall.
 

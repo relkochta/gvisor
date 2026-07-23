@@ -65,19 +65,16 @@ package kernel
 // """
 
 import (
-	"crypto/sha256"
-	"io"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/log"
+	overlay "gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/syserr"
 
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
@@ -109,7 +106,8 @@ func (t *Task) Execve(argv, envv []string, flags int32, pathname string, executa
 	r := runExecveAfterExecveCredsLock{
 		argv:        argv,
 		envv:        envv,
-		pathname:    pathname,
+		pathname:    pathname, // may be modified during resolution
+		execfn:      pathname, // remains unmodified
 		flags:       flags,
 		executable:  executable,
 		closeOnExec: closeOnExec,
@@ -123,7 +121,8 @@ func (t *Task) Execve(argv, envv []string, flags int32, pathname string, executa
 // +stateify savable
 type runExecveAfterExecveCredsLock struct {
 	argv, envv  []string
-	pathname    string
+	pathname    string // the mapped VFS path of the executable after resolution
+	execfn      string // the immutable original pathname passed to execve(2)
 	flags       int32
 	executable  *vfs.FileDescription
 	closeOnExec bool
@@ -220,7 +219,7 @@ func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskI
 	defer cu.Clean()
 	// We can't clearly hold kernel package locks while stat'ing executable.
 	if seccheck.Global.Enabled(seccheck.PointExecve) {
-		mask, info := getExecveSeccheckInfo(t, r.argv, r.envv, r.executable, r.pathname)
+		mask, info := execveSeccheckInfo(t, r.argv, r.envv, r.executable, r.pathname, r.execfn)
 		if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.Execve(t, mask, info)
 		}); err != nil {
@@ -461,17 +460,27 @@ func (t *Task) promoteLocked() {
 	oldLeader.exitNotifyLocked(false)
 }
 
-func getExecveSeccheckInfo(t *Task, argv, env []string, executable *vfs.FileDescription, pathname string) (seccheck.FieldSet, *pb.ExecveInfo) {
+func execveSeccheckInfo(t *Task, argv, env []string, executable *vfs.FileDescription, pathname, execfn string) (seccheck.FieldSet, *pb.ExecveInfo) {
 	fields := seccheck.Global.GetFieldSet(seccheck.PointExecve)
 	info := &pb.ExecveInfo{
-		Argv: argv,
-		Env:  env,
+		Argv:   argv,
+		Env:    env,
+		Execfn: execfn,
 	}
+
+	// executable is nil if opening the binary failed early or if checked before opening.
+	// Only populate file-backed metadata (such as BinaryPath, mode, or SHA-256) when an open
+	// FileDescription is available.
 	if executable != nil {
 		info.BinaryPath = pathname
 		if fields.Local.Contains(seccheck.FieldSentryExecveBinaryInfo) {
+			// Note that despite the method name IsCopiedUp, this returns true for any file located on the
+			// upper layer, including files created or downloaded directly on the upper layer that were
+			// never copied up from a lower layer.
+			info.BinaryOverlayfsUpper = overlay.IsCopiedUp(executable.Dentry())
+			info.BinaryOverlayfsLower = overlay.IsOnLower(executable.Dentry())
 			statOpts := vfs.StatOptions{
-				Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+				Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_CTIME | linux.STATX_SIZE | linux.STATX_NLINK,
 			}
 			if stat, err := executable.Stat(t, statOpts); err == nil {
 				if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
@@ -483,31 +492,46 @@ func getExecveSeccheckInfo(t *Task, argv, env []string, executable *vfs.FileDesc
 				if stat.Mask&linux.STATX_GID != 0 {
 					info.BinaryGid = stat.GID
 				}
-			}
-		}
-
-		if fields.Local.Contains(seccheck.FieldSentryExecveBinarySha256) {
-			hash := sha256.New()
-			buf := make([]byte, 1024*1024) // Read 1MB at a time.
-			dest := usermem.BytesIOSequence(buf)
-			offset := int64(0)
-
-			for {
-				if read, err := executable.PRead(t, dest, offset, vfs.ReadOptions{}); err == nil {
-					hash.Write(buf[0:read])
-					offset += read
-
-				} else if err == io.EOF {
-					hash.Write(buf[0:read])
-					info.BinarySha256 = hash.Sum(nil)
-					break
-
-				} else {
-					log.Warningf("Failed to read executable for SHA-256 hash: %v", err)
-					break
+				if stat.Mask&linux.STATX_INO != 0 {
+					info.BinaryIno = stat.Ino
+				}
+				if stat.Mask&linux.STATX_CTIME != 0 {
+					info.BinaryCtime = &pb.Timespec{
+						Sec:  stat.Ctime.Sec,
+						Nsec: int64(stat.Ctime.Nsec),
+					}
+				}
+				if stat.Mask&linux.STATX_SIZE != 0 {
+					info.BinarySize = int64(stat.Size)
+				}
+				if stat.Mask&linux.STATX_NLINK != 0 {
+					info.BinaryNlink = stat.Nlink
 				}
 			}
 		}
+
+		if fields.Local.Contains(seccheck.FieldSentryExecveBinarySHA256) || fields.Local.Contains(seccheck.FieldSentryExecveBinarySHA1) {
+			// Note: The current implementation only supports a single global ("Default")
+			// seccheck session. This is why we pull the cache directly from seccheck.Global.
+			if cache := seccheck.Global.ExecveHashCache(); cache != nil {
+				opts := cache.Opts()
+				if opts.SHA256 || opts.SHA1 {
+					hashes := resolveBinaryHashes(t, executable, cache)
+					if opts.SHA256 {
+						info.BinarySha256 = hashes.SHA256
+					}
+					if opts.SHA1 {
+						info.BinarySha1 = hashes.SHA1
+					}
+				}
+			}
+		}
+	}
+
+	if fields.Local.Contains(seccheck.FieldSentryExecveFdInfo) {
+		info.Stdin = execveFdInfo(t, 0)
+		info.Stdout = execveFdInfo(t, 1)
+		info.Stderr = execveFdInfo(t, 2)
 	}
 
 	if !fields.Context.Empty() {
@@ -515,6 +539,72 @@ func getExecveSeccheckInfo(t *Task, argv, env []string, executable *vfs.FileDesc
 		LoadSeccheckData(t, fields.Context, info.ContextData)
 	}
 	return fields, info
+}
+
+type socket interface {
+	GetSockName(t *Task) (linux.SockAddr, uint32, *syserr.Error)
+	GetPeerName(t *Task) (linux.SockAddr, uint32, *syserr.Error)
+}
+
+func sockAddrToProto(sa linux.SockAddr) (*pb.SocketIp, uint32) {
+	if sa == nil {
+		return nil, 0
+	}
+	switch a := sa.(type) {
+	case *linux.SockAddrInet:
+		return &pb.SocketIp{
+			Family: uint32(a.Family),
+			Ip:     a.Addr[:],
+			Port:   uint32(a.Port),
+		}, uint32(a.Family)
+	case *linux.SockAddrInet6:
+		return &pb.SocketIp{
+			Family: uint32(a.Family),
+			Ip:     a.Addr[:],
+			Port:   uint32(a.Port),
+		}, uint32(a.Family)
+	case *linux.SockAddrUnix:
+		return &pb.SocketIp{
+			Family: uint32(a.Family),
+		}, uint32(a.Family)
+	}
+	return nil, 0
+}
+
+func execveFdInfo(t *Task, fd int32) *pb.FdInfo {
+	file := t.GetFile(fd)
+	if file == nil {
+		return nil
+	}
+	defer file.DecRef(t)
+
+	pbfd := &pb.FdInfo{
+		Path: file.MappedName(t),
+	}
+
+	statOpts := vfs.StatOptions{
+		Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
+	}
+	if stat, err := file.Stat(t, statOpts); err == nil {
+		if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
+			pbfd.Mode = uint32(stat.Mode)
+		}
+		if stat.Mask&linux.STATX_INO != 0 {
+			pbfd.Ino = stat.Ino
+		}
+	}
+
+	if sops, ok := file.Impl().(socket); ok {
+		pbfd.Socket = &pb.SocketInfo{}
+		if local, _, err := sops.GetSockName(t); err == nil {
+			pbfd.Socket.Local, pbfd.Socket.Family = sockAddrToProto(local)
+		}
+		if remote, _, err := sops.GetPeerName(t); err == nil {
+			pbfd.Socket.Remote, pbfd.Socket.Family = sockAddrToProto(remote)
+		}
+	}
+
+	return pbfd
 }
 
 // execveCredsMutexStop is a TaskStop that a task enters if it fails to acquire the execveCredsMutex

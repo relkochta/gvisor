@@ -1349,6 +1349,7 @@ type mountInfoData struct {
 }
 
 var _ dynamicInode = (*mountInfoData)(nil)
+var _ vfs.PollableDynamicBytesSource = (*mountInfoData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (i *mountInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
@@ -1369,6 +1370,15 @@ func (i *mountInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return i.task.Kernel().VFS().GenerateProcMountInfo(ctx, rootDir, buf)
 }
 
+// GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
+func (i *mountInfoData) GetDynamicBytesPoller(ctx context.Context) *vfs.DynamicBytesPoller {
+	mntns := i.task.MountNamespace()
+	if mntns == nil {
+		return nil
+	}
+	return &mntns.Poller
+}
+
 // mountsData is used to implement /proc/[pid]/mounts.
 //
 // +stateify savable
@@ -1380,6 +1390,7 @@ type mountsData struct {
 }
 
 var _ dynamicInode = (*mountsData)(nil)
+var _ vfs.PollableDynamicBytesSource = (*mountsData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
@@ -1398,6 +1409,15 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 	defer i.fs.SafeDecRef(ctx, rootDir)
 	return i.task.Kernel().VFS().GenerateProcMounts(ctx, rootDir, buf)
+}
+
+// GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
+func (i *mountsData) GetDynamicBytesPoller(ctx context.Context) *vfs.DynamicBytesPoller {
+	mntns := i.task.MountNamespace()
+	if mntns == nil {
+		return nil
+	}
+	return &mntns.Poller
 }
 
 // +stateify savable
@@ -1448,6 +1468,14 @@ func (s *namespaceSymlink) getInode(t *kernel.Task) *nsfs.Inode {
 	case linux.CLONE_NEWUTS:
 		if utsns := t.GetUTSNamespace(); utsns != nil {
 			return utsns.GetInode()
+		}
+		return nil
+	case linux.CLONE_NEWCGROUP:
+		if !t.Kernel().Cgroup2FS().EverMounted() {
+			return nil
+		}
+		if cgroupns := t.GetCgroupNamespace(); cgroupns != nil {
+			return cgroupns.GetInode()
 		}
 		return nil
 	case linux.CLONE_NEWNS:
@@ -1598,6 +1626,8 @@ var _ dynamicInode = (*taskCgroupData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *taskCgroupData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	v2Mounted := kernel.KernelFromContext(ctx).Cgroup2FS().EverMounted()
+
 	// When a task is existing on Linux, a task's cgroup set is cleared and
 	// reset to the initial cgroup set, which is essentially the set of root
 	// cgroups. Because of this, the /proc/<pid>/cgroup file is always readable
@@ -1607,11 +1637,22 @@ func (d *taskCgroupData) Generate(ctx context.Context, buf *bytes.Buffer) error 
 	// doesn't move them into an initial cgroup set, so partway through task
 	// exit this file show a task is in no cgroups, which is incorrect. Instead,
 	// once a task has left its cgroups, we return an error.
-	if d.task.ExitState() >= kernel.TaskExitInitiated {
+	if d.task.ExitState() >= kernel.TaskExitInitiated && !v2Mounted {
 		return linuxerr.ESRCH
 	}
 
 	d.task.GenerateProcTaskCgroup(buf)
+	if v2Mounted {
+		// The cgroup path is shown relative to the cgroup namespace of the
+		// task reading this file, per Linux's proc_cgroup_show().
+		var readerNS *kernel.CgroupNamespace
+		if reader := kernel.TaskFromContext(ctx); reader != nil {
+			readerNS = reader.CgroupNamespace()
+		}
+		if cg2Entry := d.task.GetCgroup2Entry(readerNS); cg2Entry != nil {
+			fmt.Fprintf(buf, "0::%s\n", cg2Entry.Path)
+		}
+	}
 	return nil
 }
 
@@ -1646,4 +1687,58 @@ func (d *childrenData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 
 	return nil
+}
+
+// coredumpFilterData implements vfs.WritableDynamicBytesSource for /proc/[pid]/coredump_filter.
+//
+// +stateify savable
+type coredumpFilterData struct {
+	kernfs.DynamicBytesFile
+
+	task *kernel.Task
+}
+
+var _ dynamicInode = (*commData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*commData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (c *coredumpFilterData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if c.task.ExitState() == kernel.TaskExitDead {
+		return linuxerr.ESRCH
+	}
+	fmt.Fprintf(buf, "%08x\n", c.task.GetCoredumpFilter())
+	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (c *coredumpFilterData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if src.NumBytes() == 0 {
+		return 0, nil
+	}
+
+	// Limit input size so as not to impact performance if input size is large.
+	src = src.TakeFirst(hostarch.PageSize - 1)
+
+	str, err := usermem.CopyStringIn(ctx, src.IO, src.Addrs.Head().Start, int(src.Addrs.Head().Length()), src.Opts)
+	if err != nil && err != linuxerr.ENAMETOOLONG {
+		return 0, err
+	}
+
+	str = strings.TrimSpace(str)
+	base := 0
+	if strings.HasPrefix(str, "0x") {
+		str = str[2:]
+		base = 16
+	}
+	v, err := strconv.ParseUint(str, base, 32)
+	if err != nil {
+		return 0, linuxerr.EINVAL
+	}
+
+	if c.task.ExitState() == kernel.TaskExitDead {
+		return 0, linuxerr.ESRCH
+	}
+	c.task.SetCoredumpFilter(uint32(v))
+
+	return src.NumBytes(), nil
 }

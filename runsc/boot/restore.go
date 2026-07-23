@@ -15,7 +15,6 @@
 package boot
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,23 +27,24 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
-	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/timing"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -61,7 +61,185 @@ const (
 	// ContainerSpecsKey is the key used to add and pop the container specs to the
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
+
+	annotationCheckpointPrefix = "dev.gvisor.internal.checkpoint."
+
+	// annotationCheckpointPath is the path to the directory where the checkpoint files will be
+	// created. When present, it allows for the workload running inside to trigger a checkpoint
+	// without having to use the runsc CLI.
+	annotationCheckpointPath = annotationCheckpointPrefix + "path"
+
+	// annotationCheckpointResume indicates whether the sandbox should continue running after the
+	// checkpoint. Optional, defaults to false.
+	annotationCheckpointResume = annotationCheckpointPrefix + "resume"
+
+	// annotationCheckpointCompression is the compression to use for the checkpoint file. Optional,
+	// defaults to best speed compression.
+	annotationCheckpointCompression = annotationCheckpointPrefix + "compression"
+
+	// annotationCheckpointDirect indicates whether the checkpoint IOs should use O_DIRECT. Optional,
+	// defaults to false.
+	annotationCheckpointDirect = annotationCheckpointPrefix + "direct"
+
+	// annotationCheckpointExcludeCommittedZeroPages indicates whether the checkpoint should exclude
+	// committed zero pages. Optional, defaults to false.
+	annotationCheckpointExcludeCommittedZeroPages = annotationCheckpointPrefix + "exclude-committed-zero-pages"
+
+	// annotationCheckpointCudaCheckpointPath is the path to the cuda-checkpoint binary. It's required
+	// if the workload has CUDA processes.
+	annotationCheckpointCudaCheckpointPath = annotationCheckpointPrefix + "cuda-checkpoint-path"
+
+	// annotationCheckpointCudaCheckpointSequential indicates whether cuda-checkpoint should be run
+	// sequentially. Optional, defaults to false.
+	annotationCheckpointCudaCheckpointSequential = annotationCheckpointPrefix + "cuda-checkpoint-sequential"
+
+	// annotationCheckpointEnable indicates whether files under /proc/gvisor should be present in
+	// the container to allow the workload to trigger a checkpoint.
+	annotationCheckpointEnable = annotationCheckpointPrefix + "enable"
+
+	// annotationSaveRestoreExecArgv is the argv to use for the save/restore exec
+	// binary.
+	annotationSaveRestoreExecArgv = annotationCheckpointPrefix + "save-restore-exec-argv"
+
+	// annotationSaveRestoreExecTimeout is the timeout to use for the save/restore
+	// exec binary.
+	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
+
+	networkKey = "network"
 )
+
+// GetAnnotationCheckpointPath returns the checkpoint path specified in the
+// container annotation. Return empty string if no annotation is specified.
+func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string, error) {
+	path := spec.Annotations[annotationCheckpointPath]
+	if len(path) != 0 {
+		if len(conf.TestOnlyAutosaveImagePath) != 0 {
+			return "", fmt.Errorf("autosave is not supported with %q annotation", annotationCheckpointPath)
+		}
+	}
+	return path, nil
+}
+
+// GetAnnotationCheckpointCompression returns the checkpoint compression level
+// specified in the container annotation.
+func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
+	return statefile.CompressionLevelFromString(spec.Annotations[annotationCheckpointCompression])
+}
+
+// GetAnnotationCheckpointDirect returns true if the checkpoint is direct.
+func GetAnnotationCheckpointDirect(spec *specs.Spec) bool {
+	return specutils.AnnotationToBool(spec, annotationCheckpointDirect)
+}
+
+// SaveAsync starts a goroutine to save the kernel. Implements kernel.Saver.
+func (l *Loader) SaveAsync() (err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	cu := cleanup.Make(func() {
+		// Save failed, unblock the callers as the workload will resume.
+		l.k.OnCheckpointAttempt(err)
+	})
+	defer cu.Clean()
+
+	// Save either not configured or already done.
+	if len(l.saveFDs) == 0 {
+		return linuxerr.ENXIO
+	}
+
+	o, err := saveOptsFromSpec(l.root.spec, l.saveFDs, l.saveCheckpointGofer)
+	if err != nil {
+		return err
+	}
+	// Close all FDs and set saveFDs to nil to mark that save has already
+	// been triggered. So further attempts to save won't reuse and corrupt the files.
+	for _, fd := range l.saveFDs {
+		_ = fd.Close()
+	}
+	l.saveFDs = nil
+
+	go func() {
+		_ = l.save(o)
+	}()
+	// Loader.save() takes over the responsibility of calling OnCheckpointAttempt() when
+	// it completes.
+	cu.Release()
+
+	return nil
+}
+
+// saveOptsFromSpec returns the saveOpts based on annotations from the spec. `fds` are
+// no longer needed and can be closed after this is called.
+func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (*control.SaveOpts, error) {
+	// Convert the FDs to files which is required by the saveOpts.
+	files := make([]*os.File, len(fds))
+	for i, fd := range fds {
+		var err error
+		files[i], err = fd.File()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	comp, err := GetAnnotationCheckpointCompression(spec)
+	if err != nil {
+		return nil, err
+	}
+
+	saveOpts := &control.SaveOpts{
+		AppMFExcludeCommittedZeroPages: specutils.AnnotationToBool(spec, annotationCheckpointExcludeCommittedZeroPages),
+		FilePayload: urpc.FilePayload{
+			Files: files,
+		},
+		Metadata:                 comp.ToMetadata(),
+		HavePagesFile:            len(files) > 1,
+		Resume:                   specutils.AnnotationToBool(spec, annotationCheckpointResume),
+		CudaCheckpointSequential: specutils.AnnotationToBool(spec, annotationCheckpointCudaCheckpointSequential),
+	}
+	if cudaPath, ok := spec.Annotations[annotationCheckpointCudaCheckpointPath]; ok {
+		saveOpts.CudaCheckpointPath = cudaPath
+	}
+	if useCheckpointGofer {
+		saveOpts.UseCheckpointGofer = true
+		if comp == statefile.CompressionLevelNone {
+			saveOpts.HavePagesFile = true
+		}
+	}
+
+	if spec.Annotations[annotationSaveRestoreExecArgv] != "" {
+		saveRestoreExecTimeout := control.DefaultSaveRestoreExecTimeout
+		if spec.Annotations[annotationSaveRestoreExecTimeout] != "" {
+			saveRestoreExecTimeout, err = time2.ParseDuration(spec.Annotations[annotationSaveRestoreExecTimeout])
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse save-restore-exec-timeout: %w", err)
+			}
+		}
+		saveOpts.ExecOpts = control.SaveRestoreExecOpts{
+			Argv:    spec.Annotations[annotationSaveRestoreExecArgv],
+			Timeout: saveRestoreExecTimeout,
+		}
+	}
+	return saveOpts, nil
+}
+
+// The root container has the annotationCheckpointPath annotation set if
+// application-driven checkpoint is enabled. Since the root container is
+// always the first container, we can use it to initialize this global variable
+// and it will inform the future sub-containers.
+var appDrivenCheckpointEnabled = false
+
+func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalData {
+	if len(spec.Annotations[annotationCheckpointPath]) != 0 {
+		appDrivenCheckpointEnabled = true
+	}
+	return &proc.InternalData{
+		GVisorMarkerFile:           conf.GVisorMarkerFile,
+		OverrideProcs:              procFiles(conf),
+		AppDrivenCheckpointEnabled: appDrivenCheckpointEnabled,
+		SaveTriggerEnabled:         specutils.AnnotationToBool(spec, annotationCheckpointEnable),
+		FSCheckpointEnabled:        specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
+	}
+}
 
 // restorer manages a restore session for a sandbox. It stores information about
 // all containers and triggers the full sandbox restore after the last
@@ -171,15 +349,6 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	return nil
 }
 
-func createNetworkStackForRestore(l *Loader) inet.Stack {
-	// Save the current network stack to slap on top of the one that was restored.
-	curNetwork := l.k.RootNetworkNamespace().Stack()
-	if _, ok := curNetwork.(*netstack.Stack); ok {
-		return curNetwork
-	}
-	return hostinet.NewStack()
-}
-
 func (r *restorer) restore(l *Loader) error {
 	log.Infof("Starting to restore %d containers", len(r.containers))
 
@@ -188,23 +357,21 @@ func (r *restorer) restore(l *Loader) error {
 	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
 		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
-	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone {
-		// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-		return errors.New("checkpoint not supported when using hostinet")
+	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkHost {
+		return fmt.Errorf("checkpoint not supported when using %s networking", l.root.conf.Network)
+	}
+	// Checkpoints without the network key predate hostinet support.
+	savedNetwork, ok := r.metadata[networkKey]
+	if !ok {
+		savedNetwork = config.NetworkSandbox.String()
+	}
+	savedHost := savedNetwork == config.NetworkHost.String()
+	if restoreHost := l.root.conf.Network == config.NetworkHost; savedHost != restoreHost {
+		return fmt.Errorf("checkpoint created with %s networking cannot be restored with %s networking", savedNetwork, l.root.conf.Network)
 	}
 	r.timer.Reached("specs validated")
 
-	// Create a new root network namespace with the network stack of the
-	// old kernel to preserve the existing network configuration.
-	oldInetStack := createNetworkStackForRestore(l)
-	r.timer.Reached("netstack created")
-
-	// Reset the network stack in the network namespace to nil before
-	// replacing the kernel. This will not free the network stack when this
-	// old kernel is released.
-	l.k.RootNetworkNamespace().ResetStack()
-
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile)
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID)
 	if err != nil {
 		return fmt.Errorf("creating platform: %v", err)
 	}
@@ -227,6 +394,31 @@ func (r *restorer) restore(l *Loader) error {
 		// pprof.Initialize opens /proc/self/maps, so has to be called before
 		// installing seccomp filters.
 		pprof.Initialize()
+	}
+
+	if l.root.conf.Network == config.NetworkHost {
+		devFile, err := os.Open("/proc/net/dev")
+		if err != nil {
+			log.Warningf("Failed to open /proc/net/dev during restore: %v", err)
+		} else {
+			l.hostinetNetDevFile = devFile
+		}
+		snmpFile, err := os.Open("/proc/net/snmp")
+		if err != nil {
+			log.Warningf("Failed to open /proc/net/snmp during restore: %v", err)
+		} else {
+			l.hostinetNetSNMPFile = snmpFile
+		}
+		defer func() {
+			if l.hostinetNetDevFile != nil {
+				l.hostinetNetDevFile.Close()
+				l.hostinetNetDevFile = nil
+			}
+			if l.hostinetNetSNMPFile != nil {
+				l.hostinetNetSNMPFile.Close()
+				l.hostinetNetSNMPFile = nil
+			}
+		}()
 	}
 
 	// Seccomp filters have to be applied before vfs restore and before parsing
@@ -275,7 +467,11 @@ func (r *restorer) restore(l *Loader) error {
 		r.asyncMFLoader.KickoffPrivate(mfmap)
 	}
 
-	ctx, err = r.prepareRestoreContextExtraLocked(ctx, l)
+	ctx, err = r.prepareNvproxyRestoreContextLocked(ctx, l)
+	if err != nil {
+		return err
+	}
+	ctx, err = r.prepareTPURestoreContextLocked(ctx, l)
 	if err != nil {
 		return err
 	}
@@ -289,7 +485,7 @@ func (r *restorer) restore(l *Loader) error {
 		r.timer.Reached("rootfs upper layer extracted")
 		return nil
 	}
-	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
 	}
 	r.timer.Reached("kernel loaded")
@@ -325,7 +521,10 @@ func (r *restorer) restore(l *Loader) error {
 	l.root.procArgs = kernel.CreateProcessArgs{}
 	l.sandboxID = l.root.cid
 
-	// Update all tasks in the system with their respective new container IDs.
+	// Update all tasks in the system with:
+	// 1. their respective new container IDs.
+	// 2. the new hostname and domainname.
+	visitedUTS := make(map[*kernel.UTSNamespace]struct{})
 	for _, task := range l.k.TaskSet().Root.Tasks() {
 		oldCid := task.ContainerID()
 		name := l.k.ContainerName(oldCid)
@@ -334,6 +533,13 @@ func (r *restorer) restore(l *Loader) error {
 			return fmt.Errorf("unable to remap task with CID %q (name: %q). Available names: %v", task.ContainerID(), name, l.containerIDs)
 		}
 		task.RestoreContainerID(newCid)
+
+		if utsns := task.UTSNamespace(); utsns != nil {
+			if _, ok := visitedUTS[utsns]; !ok {
+				visitedUTS[utsns] = struct{}{}
+				utsns.RestoreSpecValues(l.root.spec.Hostname, l.root.spec.Domainname)
+			}
+		}
 	}
 
 	// Rebuild `processes` map with containers' root process from the restored kernel.
@@ -363,8 +569,8 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
-
-	l.kernelInitExtra(ctx)
+	l.k.SetSaver(l)
+	l.createRemappedNvproxyDeviceFiles(ctx)
 
 	// Refresh the control server with the newly created kernel.
 	l.ctrl.refreshHandlers()
@@ -487,11 +693,6 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 		l.k.OnCheckpointAttempt(err)
 	}()
 
-	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-	if l.root.conf.Network == config.NetworkHost {
-		return errors.New("checkpoint not supported when using hostinet")
-	}
-
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)
 	}
@@ -499,6 +700,8 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 
 	// Save runsc version.
 	saveOpts.Metadata[VersionKey] = version.Version()
+
+	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
@@ -510,7 +713,10 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 	// Save start time of the runsc process.
 	saveOpts.StartTime = starttime.Get()
 
-	if err := l.prepareSaveOptsExtra(saveOpts); err != nil {
+	if err := l.setNvproxyDeviceRemapMetadata(saveOpts); err != nil {
+		return err
+	}
+	if err := l.setTPUDeviceRemapMetadata(saveOpts); err != nil {
 		return err
 	}
 

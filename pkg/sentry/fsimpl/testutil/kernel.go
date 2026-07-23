@@ -42,6 +42,9 @@ import (
 	// Platforms are pluggable.
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
+
+	// Cgroup2fs is required by Kernel.Init.
+	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 )
 
 var (
@@ -106,6 +109,7 @@ func Boot() (*kernel.Kernel, error) {
 		RootUTSNamespace:  kernel.NewUTSNamespace("hostname", "domain", creds.UserNamespace),
 		RootIPCNamespace:  kernel.NewIPCNamespace(creds.UserNamespace),
 		RootPIDNamespace:  kernel.NewRootPIDNamespace(creds.UserNamespace),
+		Cgroup2FSInit:     cgroup2fs.NewFilesystem,
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %v", err)
 	}
@@ -152,12 +156,14 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 		AllowedCPUMask:   sched.NewFullCPUSet(k.ApplicationCores()),
 		UTSNamespace:     kernel.UTSNamespaceFromContext(ctx),
 		IPCNamespace:     kernel.IPCNamespaceFromContext(ctx),
+		CgroupNamespace:  k.RootCgroupNamespace(),
 		MountNamespace:   mntns,
 		FSContext:        kernel.NewFSContext(root, cwd, 0022),
 		FDTable:          k.NewFDTable(),
 		UserCounters:     k.GetUserCounters(creds.RealKUID),
 	}
 	config.NetworkNamespace.IncRef()
+	config.CgroupNamespace.IncRef()
 	config.Credentials.UserNamespace.IncRef()
 	t, err := k.TaskSet().NewTask(ctx, config)
 	if err != nil {

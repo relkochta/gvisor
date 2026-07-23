@@ -76,6 +76,13 @@ syscall_test(
 )
 
 syscall_test(
+    size = "large",
+    mount_cgroup_v2 = True,
+    shard_count = more_shards,
+    test = "//test/syscalls/linux:cgroup2_test",
+)
+
+syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chdir_test",
@@ -425,6 +432,12 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    save = False,
+    test = "//test/syscalls/linux:mount_fd_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:mq_test",
 )
 
@@ -567,6 +580,10 @@ syscall_test(
 syscall_test(
     add_hostinet = True,
     test = "//test/syscalls/linux:proc_net_test",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:proc_pid_coredump_test",
 )
 
 syscall_test(
@@ -1318,6 +1335,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:xattr_test",
 )

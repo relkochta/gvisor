@@ -34,9 +34,10 @@ import (
 // configured by the user at /proc/sys/fs/mount-max, but the default is
 // 100,000. We set the gVisor limit to 10,000.
 const (
-	MountMax     = 10000
-	nsfsName     = "nsfs"
-	cgroupFsName = "cgroup"
+	MountMax      = 10000
+	nsfsName      = "nsfs"
+	cgroupFsName  = "cgroup"
+	cgroup2FsName = "cgroup2"
 )
 
 // A Mount is a replacement of a Dentry (Mount.key.point) from one Filesystem
@@ -279,9 +280,11 @@ func (vfs *VirtualFilesystem) MountDisconnected(ctx context.Context, creds *auth
 // peers and followers. This method consumes the reference on mp. It is analogous to
 // fs/namespace.c:attach_recursive_mnt() in Linux. The mount point mp must have its dentry locked
 // before calling attachTreeLocked.
+// If tryMove is set to true, mnt is detached from its parent mount before performing the attach
+// operation.
 //
 // +checklocks:vfs.mountMu
-func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, mp VirtualDentry) error {
+func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, mp VirtualDentry, tryMove bool) error {
 	cleanup := cleanup.Make(func() {
 		vfs.cleanupGroupIDs(mnt.submountsLocked()) // +checklocksforce
 		mp.dentry.mu.Unlock()
@@ -325,6 +328,19 @@ func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, 
 		}
 	}
 	vfs.mounts.seq.BeginWrite()
+	if tryMove {
+		if mnt.parent() != nil {
+			// Moving a submount: disconnect from old parent mount
+			oldMp := vfs.disconnectLocked(mnt)
+			vfs.delayDecRef(oldMp)
+			vfs.delayDecRef(mnt)
+		} else if mnt.ns != nil && mnt.ns.anon && mnt.ns.root == mnt {
+			// Moving the root of an anonymous mount namespace: sever the mount from its ns
+			mnt.ns.root = nil
+			vfs.delayDecRef(mnt)
+		}
+		vfs.migrateChildrenNs(mnt, mp.mount.ns)
+	}
 	vfs.connectLocked(mnt, mp, mp.mount.ns)
 	vfs.mounts.seq.EndWrite()
 	mp.dentry.mu.Unlock()
@@ -335,12 +351,18 @@ func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, 
 		owner = mntns.Owner
 		mntns.DecRef(ctx)
 	}
+	notifiedNS := map[*MountNamespace]struct{}{mp.mount.ns: {}}
+	mp.mount.ns.notify()
 	for pmnt := range propMnts {
 		vfs.commitMount(ctx, pmnt)
 		if pmnt.parent().ns.Owner != owner {
 			vfs.lockMountTree(pmnt)
 		}
 		pmnt.locked = false
+		if _, ok := notifiedNS[pmnt.parent().ns]; !ok {
+			notifiedNS[pmnt.parent().ns] = struct{}{}
+			pmnt.parent().ns.notify()
+		}
 	}
 	return nil
 }
@@ -389,7 +411,128 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 		vfs.delayDecRef(mp)
 		return linuxerr.EINVAL
 	}
-	return vfs.attachTreeLocked(ctx, mnt, mp)
+	if mp.dentry == mnt.root {
+		mp.dentry.mu.Unlock()
+		vfs.delayDecRef(mp)
+		return linuxerr.EBUSY
+	}
+	return vfs.attachTreeLocked(ctx, mnt, mp, false)
+}
+
+// MoveMountAt connects source's mount at the path represented by target, possibly first disconnecting source's mnt.
+// The target's mountpoint may or may not be connected.
+// The path lookups for source and target checks traversal permissions against creds.
+//
+// Roughly analogous to Linux fs/namespace.c:do_move_mount().
+func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Credentials, taskMountNs *MountNamespace, source *PathOperation, target *PathOperation) error {
+	// Lookup the source path
+	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{CheckSearchable: true})
+	if err != nil {
+		return err
+	}
+	defer sourceVd.DecRef(ctx)
+
+	// The source path must be the root of its mount.
+	sourceMnt := sourceVd.mount
+	if sourceVd.dentry != sourceMnt.root {
+		return linuxerr.EINVAL
+	}
+
+	// Fetch source stat info
+	sourceStat, err := vfs.StatAt(ctx, creds, &PathOperation{
+		Root:  sourceVd,
+		Start: sourceVd,
+	}, &StatOptions{
+		Mask: linux.STATX_MODE,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Lookup the target path
+	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{CheckSearchable: true})
+	if err != nil {
+		return err
+	}
+	targetCleanup := cleanup.Make(func() {
+		targetVd.DecRef(ctx)
+	})
+	defer targetCleanup.Clean()
+
+	// Fetch target stat info
+	targetStat, err := vfs.StatAt(ctx, creds, &PathOperation{
+		Root:  targetVd,
+		Start: targetVd,
+	}, &StatOptions{
+		Mask: linux.STATX_MODE,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Only allow directory-to-directory or file-to-file mount moves
+	if linux.FileMode(sourceStat.Mode).IsDir() != linux.FileMode(targetStat.Mode).IsDir() {
+		return linuxerr.EINVAL
+	}
+
+	// We can't hold vfs.mountMu while calling FilesystemImpl methods due to
+	// lock ordering.
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
+
+	targetCleanup.Release()
+	mp, err := vfs.lockMountpoint(targetVd)
+	if err != nil {
+		return err
+	}
+	mpCleanup := cleanup.Make(func() {
+		mp.dentry.mu.Unlock()
+		vfs.delayDecRef(mp) // +checklocksforce
+	})
+	defer mpCleanup.Clean()
+
+	// Is the source mount in our mount namespace?
+	if vfs.validInMountNS(ctx, sourceMnt) {
+		// Source mount must:
+		// - Not be locked
+		// - Have a non-shared parent
+		if sourceMnt.locked || sourceMnt.parent() == nil || sourceMnt.parent().isShared {
+			return linuxerr.EINVAL
+		}
+		// Target mount must:
+		// - Also be in our namespace
+		if !vfs.validInMountNS(ctx, mp.mount) {
+			return linuxerr.EINVAL
+		}
+	} else {
+		// If source is not in our mount ns, it must be:
+		// - Mounted at the root of anonymous mount ns
+		if sourceMnt.umounted || sourceMnt.ns == nil || !sourceMnt.ns.anon || sourceMnt != sourceMnt.ns.root {
+			return linuxerr.EINVAL
+		}
+		// - In a *different* mount ns from the destination (i.e. not moving within its own anon mount ns)
+		if sourceMnt.ns == mp.mount.ns || mp.mount.ns == nil {
+			return linuxerr.EINVAL
+		}
+		// And the destination, if not in our mount ns, must be:
+		// - Mounted
+		// - In an appropriate anonymous mount ns
+		if !vfs.validInMountNS(ctx, mp.mount) {
+			if mp.mount.umounted || !mp.mount.ns.anonCanBeOperatedOn(taskMountNs) {
+				return linuxerr.EINVAL
+			}
+		}
+	}
+
+	// Verify that source is not an ancestor of destination
+	for p := mp.mount; p != nil; p = p.parent() {
+		if p == sourceMnt {
+			return linuxerr.ELOOP
+		}
+	}
+
+	mpCleanup.Release()
+	return vfs.attachTreeLocked(ctx, sourceVd.mount, mp, true /* tryMove */)
 }
 
 // lockMountpoint returns VirtualDentry with a locked Dentry. If vd is a
@@ -533,6 +676,7 @@ func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, ro
 				dentry: c.point(),
 			}
 			mp.IncRef()
+			m.IncRef()
 			m.setKey(mp)
 			if p.parentMount.children == nil {
 				p.parentMount.children = make(map[*Mount]struct{})
@@ -602,7 +746,7 @@ func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credential
 	defer cleanup.Clean()
 	// Namespace mounts can be binded to other mount points.
 	fsName := sourceVd.mount.Filesystem().FilesystemType().Name()
-	if !vfs.validInMountNS(ctx, sourceVd.mount) && fsName != nsfsName && fsName != cgroupFsName {
+	if !vfs.validInMountNS(ctx, sourceVd.mount) && fsName != nsfsName && fsName != cgroupFsName && fsName != cgroup2FsName {
 		return linuxerr.EINVAL
 	}
 	if !vfs.validInMountNS(ctx, mp.mount) {
@@ -625,7 +769,7 @@ func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credential
 
 	vfs.delayDecRef(clone)
 	clone.locked = false
-	if err := vfs.attachTreeLocked(ctx, clone, mp); err != nil {
+	if err := vfs.attachTreeLocked(ctx, clone, mp, false); err != nil {
 		vfs.abortUncomittedChildren(ctx, clone)
 		return err
 	}
@@ -645,7 +789,11 @@ func (vfs *VirtualFilesystem) RemountAt(ctx context.Context, creds *auth.Credent
 	if !vfs.validInMountNS(ctx, mnt) {
 		return linuxerr.EINVAL
 	}
-	return mnt.setMountOptions(opts)
+	if err := mnt.setMountOptions(opts); err != nil {
+		return err
+	}
+	mnt.ns.notify()
+	return nil
 }
 
 // MountAt creates and mounts a Filesystem configured by the given arguments.
@@ -790,11 +938,21 @@ func (vfs *VirtualFilesystem) umountTreeLocked(mnt *Mount, opts *umountRecursive
 		vfs.unlockPropagationMounts(mnt)
 	}
 	umountMnts := mnt.submountsLocked()
+	// Collect affected namespaces before umounting, since ns pointers may be
+	// cleared during disconnect.
+	affectedNS := make(map[*MountNamespace]struct{})
+	for _, m := range umountMnts {
+		affectedNS[m.ns] = struct{}{}
+	}
 	for _, mnt := range umountMnts {
 		vfs.umount(mnt)
 	}
 	if opts.propagate {
-		umountMnts = append(umountMnts, vfs.propagateUmount(umountMnts)...)
+		propMnts := vfs.propagateUmount(umountMnts)
+		for _, m := range propMnts {
+			affectedNS[m.ns] = struct{}{}
+		}
+		umountMnts = append(umountMnts, propMnts...)
 	}
 
 	vfs.mounts.seq.BeginWrite()
@@ -828,6 +986,9 @@ func (vfs *VirtualFilesystem) umountTreeLocked(mnt *Mount, opts *umountRecursive
 		vfs.setPropagation(mnt, linux.MS_PRIVATE)
 	}
 	vfs.mounts.seq.EndWrite()
+	for ns := range affectedNS {
+		ns.notify()
+	}
 }
 
 // +checklocks:vfs.mountMu
@@ -852,6 +1013,30 @@ func (vfs *VirtualFilesystem) changeMountpoint(mnt *Mount, mp VirtualDentry) {
 	mp.IncRef()
 	vfs.connectLocked(mnt, mp, mp.mount.ns)
 	mp.dentry.mu.Unlock()
+	mp.mount.ns.notify()
+}
+
+// migrateChildrenNs recursively migrates mnt's children into newNs.
+//
+// Preconditions:
+//   - vfs.mountMu must be locked.
+func (vfs *VirtualFilesystem) migrateChildrenNs(mnt *Mount, newNs *MountNamespace) {
+	for c := range mnt.children {
+		vd := c.getKey()
+		oldNs := c.ns
+
+		oldNs.mountpoints[vd.dentry]--
+		oldNs.mounts--
+		if oldNs.mountpoints[vd.dentry] == 0 {
+			delete(oldNs.mountpoints, vd.dentry)
+		}
+
+		c.ns = newNs
+		newNs.mountpoints[vd.dentry]++
+		newNs.mounts++
+
+		vfs.migrateChildrenNs(c, newNs)
+	}
 }
 
 // connectLocked makes vd the mount parent/point for mnt. It consumes
@@ -1479,12 +1664,16 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 			continue
 		}
 		var pathFromFS string
-		pathFromFS, err = vfs.PathnameInFilesystem(ctx, mntRootVD)
-		if err != nil {
-			// For some reason we didn't get a path. Log a warning
-			// and run with empty path.
-			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root: %v", err)
-			continue
+		if mrpp, ok := mntRootVD.mount.fs.impl.(MountRootPathProvider); ok {
+			pathFromFS = mrpp.MountRootPath(ctx, mntRootVD)
+		} else {
+			pathFromFS, err = vfs.PathnameInFilesystem(ctx, mntRootVD)
+			if err != nil {
+				// For some reason we didn't get a path. Log a warning
+				// and run with empty path.
+				ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root: %v", err)
+				continue
+			}
 		}
 		if pathFromFS == "" {
 			// The path is not reachable from root.

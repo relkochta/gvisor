@@ -19,6 +19,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -481,6 +482,70 @@ TEST(MountTest, BindMountReadonly) {
   EXPECT_EQ(s.st_size, strlen(msg));
 }
 
+// Special files (such as FIFO) should be openable for writing even on a
+// read-only mount. Regular files should not.
+TEST(MountTest, FifoWritableOnReadonlyMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), kTmpfs, 0, "", 0));
+
+  // Populate the still-writable mount with a FIFO and a regular file.
+  std::string const fifo_path = JoinPath(dir.path(), "fifo");
+  std::string const reg_path = JoinPath(dir.path(), "reg");
+  ASSERT_THAT(mkfifo(fifo_path.c_str(), 0666), SyscallSucceeds());
+  FileDescriptor reg_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(reg_path, O_WRONLY | O_CREAT, 0644));
+  reg_fd.reset();
+
+  // Remount read-only.
+  ASSERT_THAT(
+      mount("", dir.path().c_str(), nullptr, MS_REMOUNT | MS_RDONLY, nullptr),
+      SyscallSucceeds());
+  ASSERT_THAT(access(dir.path().c_str(), W_OK), SyscallFailsWithErrno(EROFS));
+
+  // The FIFO opens writably despite the RO mount.
+  FileDescriptor fifo_fd = ASSERT_NO_ERRNO_AND_VALUE(Open(fifo_path, O_RDWR));
+  EXPECT_THAT(write(fifo_fd.get(), "x", 1), SyscallSucceedsWithValue(1));
+
+  // The regular file still fails a writable open with EROFS, but a read-only
+  // open succeeds.
+  EXPECT_THAT(open(reg_path.c_str(), O_WRONLY), SyscallFailsWithErrno(EROFS));
+  ASSERT_NO_ERRNO_AND_VALUE(Open(reg_path, O_RDONLY));
+}
+
+// Same test as above, but for a character device.
+TEST(MountTest, DeviceFileWritableOnReadonlyMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), kTmpfs, 0, "", 0));
+
+  // Create a /dev/null-style character device while the mount is writable.
+  std::string const dev_path = JoinPath(dir.path(), "null");
+  int ret = mknod(dev_path.c_str(), S_IFCHR | 0666, makedev(1, 3));
+  const bool was_eperm = Value(ret, SyscallFailsWithErrno(EPERM));
+
+  // In our test infrastructure, this may not always be possible to test on
+  // native since CAP_MKNOD is required in the *initial* user ns, and native
+  // tests are sometimes run in a user ns.
+  SKIP_IF(was_eperm);
+
+  // (But otherwise, mknod() should succeed.)
+  ASSERT_THAT(ret, SyscallSucceeds());
+
+  // Remount read-only.
+  ASSERT_THAT(
+      mount("", dir.path().c_str(), nullptr, MS_REMOUNT | MS_RDONLY, nullptr),
+      SyscallSucceeds());
+
+  // The device node opens writably and accepts writes despite the RO mount.
+  FileDescriptor dev_fd = ASSERT_NO_ERRNO_AND_VALUE(Open(dev_path, O_WRONLY));
+  EXPECT_THAT(write(dev_fd.get(), "x", 1), SyscallSucceedsWithValue(1));
+}
+
 // Test that bind mounting a directory onto a regular file fails with ENOTDIR.
 TEST(MountTest, BindMountDirectoryOntoFileFails) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
@@ -610,6 +675,74 @@ TEST(MountTest, RenameRemoveMountPoint) {
   ASSERT_THAT(rmdir(dir.path().c_str()), SyscallFailsWithErrno(EBUSY));
 }
 
+TEST(MountTest, MountMoveSuccess) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const privateParent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto privateMount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("source", privateParent.path(), kTmpfs, 0, "", 0));
+  EXPECT_THAT(mount("", privateParent.path().c_str(), "", MS_PRIVATE, ""),
+              SyscallSucceeds());
+
+  auto const dir1 =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(privateParent.path()));
+  auto const dir2 =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(privateParent.path()));
+  auto mount1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("source", dir1.path(), kTmpfs, 0, "", 0));
+
+  auto fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(dir1.path(), "foo").c_str(), O_CREAT | O_RDWR, 0777));
+  EXPECT_THAT(close(fd.release()), SyscallSucceeds());
+
+  auto const mount2 = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(dir1.path(), dir2.path(), "", MS_MOVE, "", 0));
+  mount1.Release();
+
+  EXPECT_THAT(Exists(JoinPath(dir1.path(), "foo")),
+              IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(Exists(JoinPath(dir2.path(), "foo")),
+              IsPosixErrorOkAndHolds(true));
+}
+
+// TODO(b/305893463): When support for MS_UNBINDABLE is added, moving a mount
+// tree with unbindable children to an MS_SHARED destination should EINVAL.
+
+TEST(MountTest, MountMoveSharedParent) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const parentDir1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  auto parentMount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("source", parentDir1.path(), kTmpfs, 0, "", 0));
+  EXPECT_THAT(mount("", parentDir1.path().c_str(), "", MS_SHARED, ""),
+              SyscallSucceeds());
+
+  auto const subDir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parentDir1.path()));
+  auto subMount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("source", subDir.path(), kTmpfs, 0, "", 0));
+
+  EXPECT_THAT(
+      mount(subDir.path().c_str(), dir2.path().c_str(), "", MS_MOVE, nullptr),
+      SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(MountTest, MountMoveSourceNotMounted) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  auto fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(dir1.path(), "foo").c_str(), O_CREAT | O_RDWR, 0777));
+  EXPECT_THAT(close(fd.release()), SyscallSucceeds());
+
+  EXPECT_THAT(mount(dir1.path().c_str(), dir2.path().c_str(), "", MS_MOVE, ""),
+              SyscallFailsWithErrno(EINVAL));
+}
+
 TEST(MountTest, MountInfo) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
@@ -660,6 +793,31 @@ TEST(MountTest, TmpfsSizeRoundUpSinglePageSize) {
   EXPECT_EQ(buf.st_size, kPageSize);
 
   // Grow to size beyond tmpfs allocated bytes.
+  ASSERT_THAT(fallocate(fd.get(), 0, 0, kPageSize + 1),
+              SyscallFailsWithErrno(ENOSPC));
+  ASSERT_THAT(fstat(fd.get(), &buf), SyscallSucceeds());
+  EXPECT_EQ(buf.st_size, kPageSize);
+}
+
+TEST(MountTest, TmpfsNrBlocksAllocation) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "nr_blocks=1", 0));
+  auto fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(dir.path(), "foo"), O_CREAT | O_RDWR, 0777));
+
+  // Check that it starts at size zero.
+  struct stat buf;
+  ASSERT_THAT(fstat(fd.get(), &buf), SyscallSucceeds());
+  EXPECT_EQ(buf.st_size, 0);
+
+  // Grow to 1 Page Size.
+  ASSERT_THAT(fallocate(fd.get(), 0, 0, kPageSize), SyscallSucceeds());
+  ASSERT_THAT(fstat(fd.get(), &buf), SyscallSucceeds());
+  EXPECT_EQ(buf.st_size, kPageSize);
+
+  // Grow to size beyond the block limit.
   ASSERT_THAT(fallocate(fd.get(), 0, 0, kPageSize + 1),
               SyscallFailsWithErrno(ENOSPC));
   ASSERT_THAT(fstat(fd.get(), &buf), SyscallSucceeds());
@@ -2763,6 +2921,181 @@ TEST(MountTest, OverlayfsOnGoferBehavior) {
                          sizeof(xattr_buf)),
                 SyscallSucceeds());
     EXPECT_STREQ(xattr_buf, "value");
+  }
+}
+
+TEST(MountTest, PollMountInfo) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  for (const char* path : {"/proc/self/mounts", "/proc/self/mountinfo"}) {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_RDONLY));
+    int epfd_raw = epoll_create1(0);
+    ASSERT_GE(epfd_raw, 0) << "epoll_create1 failed: " << strerror(errno);
+    FileDescriptor epfd(epfd_raw);
+
+    struct epoll_event ev = {};
+    ev.events = EPOLLPRI | EPOLLERR;
+    ev.data.fd = fd.get();
+    ASSERT_THAT(epoll_ctl(epfd.get(), EPOLL_CTL_ADD, fd.get(), &ev),
+                SyscallSucceeds());
+
+    // Drains one event and assert it has EPOLLPRI or EPOLLERR.
+    auto expectEvent = [&](absl::string_view label) {
+      struct epoll_event events[1] = {};
+      int nfds = epoll_wait(epfd.get(), events, 1, 0);
+      ASSERT_GE(nfds, 0) << label << ": epoll_wait failed: " << strerror(errno);
+      ASSERT_EQ(nfds, 1) << label << ": expected 1 event";
+      EXPECT_TRUE(events[0].events & (EPOLLPRI | EPOLLERR)) << label;
+    };
+
+    // Asserts no events pending.
+    auto expectNoEvent = [&](absl::string_view label) {
+      struct epoll_event events[1] = {};
+      int nfds = epoll_wait(epfd.get(), events, 1, 0);
+      ASSERT_GE(nfds, 0) << label << ": epoll_wait failed: " << strerror(errno);
+      EXPECT_EQ(nfds, 0) << label;
+    };
+
+    // Initially, there should be no events.
+    expectNoEvent("initial");
+
+    // mount() triggers event.
+    auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    auto mnt =
+        ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), kTmpfs, 0, "", 0));
+    expectEvent("mount");
+
+    // Event is consumed by poll itself, no read needed.
+    expectNoEvent("after mount consumed");
+
+    // remount triggers event.
+    ASSERT_THAT(
+        mount("", dir.path().c_str(), nullptr, MS_REMOUNT | MS_RDONLY, nullptr),
+        SyscallSucceeds());
+    expectEvent("remount");
+    expectNoEvent("after remount consumed");
+
+    // Undo the read-only remount so umount works cleanly.
+    ASSERT_THAT(mount("", dir.path().c_str(), nullptr, MS_REMOUNT, nullptr),
+                SyscallSucceeds());
+    // Drain the remount-undo event.
+    expectEvent("remount undo");
+
+    // Umount triggers event.
+    mnt.Release();
+    ASSERT_THAT(umount2(dir.path().c_str(), 0), SyscallSucceeds());
+    expectEvent("umount");
+    expectNoEvent("after umount consumed");
+
+    // Move mount triggers event.
+    //
+    // MS_MOVE is not allowed under a MS_SHARED parent mount, so we create a
+    // private parent mount containing both src and dst.
+    auto const privateParent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    auto privateMount = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount("", privateParent.path(), kTmpfs, 0, "", 0));
+    expectEvent("move setup private parent mount");
+
+    ASSERT_THAT(mount("", privateParent.path().c_str(), "", MS_PRIVATE, ""),
+                SyscallSucceeds());
+
+    auto const src =
+        ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(privateParent.path()));
+    auto const dst =
+        ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(privateParent.path()));
+    auto srcMnt =
+        ASSERT_NO_ERRNO_AND_VALUE(Mount("", src.path(), kTmpfs, 0, "", 0));
+    expectEvent("move setup src mount");
+
+    auto dstMnt = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount(src.path(), dst.path(), "", MS_MOVE, "", 0));
+    srcMnt.Release();
+    expectEvent("move mount");
+    expectNoEvent("after move consumed");
+  }
+}
+
+TEST(MountTest, MountInfoAfterUnshare) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  for (const char* path : {"/proc/self/mounts", "/proc/self/mountinfo"}) {
+    int pipefd[2];
+    ASSERT_THAT(pipe(pipefd), SyscallSucceeds());
+
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_RDONLY));
+    int epfd_raw = epoll_create1(0);
+    ASSERT_GE(epfd_raw, 0) << "epoll_create1 failed: " << strerror(errno);
+    FileDescriptor epfd(epfd_raw);
+
+    struct epoll_event ev = {};
+    ev.events = EPOLLPRI | EPOLLERR;
+    ev.data.fd = fd.get();
+    ASSERT_THAT(epoll_ctl(epfd.get(), EPOLL_CTL_ADD, fd.get(), &ev),
+                SyscallSucceeds());
+
+    // Initially, no events on fd.
+    auto expectNoEvent = [](int epfd_raw) {
+      struct epoll_event events[1] = {};
+      int nfds = epoll_wait(epfd_raw, events, 1, 0);
+      return nfds == 0;
+    };
+    ASSERT_TRUE(expectNoEvent(epfd.get()));
+
+    pid_t child = fork();
+    if (child == 0) {
+      close(pipefd[1]);
+
+      auto childExpectEvent = [](int epfd_raw) {
+        struct epoll_event events[1] = {};
+        int nfds = epoll_wait(epfd_raw, events, 1, 0);
+        TEST_PCHECK(nfds == 1);
+        TEST_CHECK(events[0].events & (EPOLLPRI | EPOLLERR));
+      };
+
+      // Unshare into a new mount namespace.
+      TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+
+      // Wait for the parent to perform a mount in the parent's mountns.
+      char c;
+      TEST_PCHECK(read(pipefd[0], &c, 1) == 1);
+      close(pipefd[0]);
+
+      // The inherited fd was opened before unshare(CLONE_NEWNS), so it should
+      // see the mount event from the parent's mount namespace.
+      childExpectEvent(epfd.get());
+
+      // Reading from the inherited fd should still give info about the old
+      // mount namespace (viz., where the parent mounted dir.path()).
+      lseek(fd.get(), 0, SEEK_SET);
+      char buf[65536];
+      size_t total = 0;
+      int n;
+      while ((total < sizeof(buf) - 1) &&
+             (n = read(fd.get(), buf + total, sizeof(buf) - 1 - total)) > 0) {
+        total += n;
+      }
+      TEST_PCHECK(n >= 0);
+      TEST_CHECK(absl::StrContains(absl::string_view(buf, total), dir.path()));
+
+      _exit(0);
+    }
+    close(pipefd[0]);
+    ASSERT_THAT(child, SyscallSucceeds());
+
+    // Perform a mount in the parent's mount namespace.
+    auto mnt =
+        ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), kTmpfs, 0, "", 0));
+
+    // Notify the child that the mount is complete.
+    char c = 'a';
+    ASSERT_THAT(write(pipefd[1], &c, 1), SyscallSucceedsWithValue(1));
+    close(pipefd[1]);
+
+    int status;
+    ASSERT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
 }
 

@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"fmt"
 
+	"slices"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -92,9 +94,16 @@ func newRanged(sreg uint8, op int, low, high []byte) (*ranged, *syserr.Annotated
 	return &ranged{sregIdx: sregIdx, rop: rop, low: low, high: high}, nil
 }
 
+func (op *ranged) deepCopy() operation {
+	opCopy := *op
+	opCopy.low = slices.Clone(op.low)
+	opCopy.high = slices.Clone(op.high)
+	return &opCopy
+}
+
 // evaluate for Ranged checks whether the source register data is within the
 // specified inclusive range and breaks from the rule if comparison is false.
-func (op ranged) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule) {
+func (op ranged) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 	// Gets the data from the source register.
 	regBuf := regs.data[op.sregIdx : op.sregIdx+len(op.low)]
 	// Compares register data to both lower and upper bounds.
@@ -113,4 +122,9 @@ func (op ranged) GetExprName() string {
 func (op ranged) Dump() ([]byte, *syserr.AnnotatedError) {
 	log.Warningf("Nftables: Dumping ranged operation is not implemented")
 	return nil, nil
+}
+
+// checkCompatibility implements operation.checkCompatibility.
+func (op ranged) checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError {
+	return nil
 }

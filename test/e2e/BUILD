@@ -38,6 +38,7 @@ go_test(
     size = "large",
     srcs = [
         "integration_runtime_test.go",
+        "systemd_test.go",
     ],
     # runsc is needed to invalidate the bazel cache in case of any code changes.
     data = ["//runsc"],
@@ -49,6 +50,7 @@ go_test(
     ],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/cleanup",
         "//pkg/fsutil",
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",

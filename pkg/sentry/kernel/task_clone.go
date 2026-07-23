@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/nsfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
@@ -31,15 +32,14 @@ import (
 )
 
 // SupportedCloneFlags is the bitwise OR of all the supported flags for clone.
-// TODO(b/290826530): Implement CLONE_INTO_CGROUP when cgroups v2 is
-// implemented.
 const SupportedCloneFlags = linux.CLONE_VM | linux.CLONE_FS | linux.CLONE_FILES | linux.CLONE_SYSVSEM |
 	linux.CLONE_THREAD | linux.CLONE_SIGHAND | linux.CLONE_NEWPID |
 	linux.CLONE_CHILD_CLEARTID | linux.CLONE_CHILD_SETTID | linux.CLONE_PARENT |
 	linux.CLONE_PARENT_SETTID | linux.CLONE_SETTLS | linux.CLONE_NEWUSER | linux.CLONE_NEWUTS |
 	linux.CLONE_NEWIPC | linux.CLONE_NEWNET | linux.CLONE_PTRACE | linux.CLONE_UNTRACED |
 	linux.CLONE_IO | linux.CLONE_VFORK | linux.CLONE_DETACHED | linux.CLONE_NEWNS |
-	linux.CLONE_PIDFD | linux.CLONE_CLEAR_SIGHAND
+	linux.CLONE_PIDFD | linux.CLONE_CLEAR_SIGHAND | linux.CLONE_INTO_CGROUP |
+	linux.CLONE_NEWCGROUP
 
 func failCloneAfterTaskCreation(nt *Task) {
 	// nt has been visible to the rest of the system since NewTask, so
@@ -47,10 +47,12 @@ func failCloneAfterTaskCreation(nt *Task) {
 	// for group signal delivery, had children reparented to it, etc.
 	// Thus we can't just drop it on the floor. Instead, instruct the
 	// task goroutine to exit immediately, as quietly as possible.
+	nt.k.tasks.mu.Lock()
 	nt.exitTracerNotified = true
 	nt.exitTracerAcked = true
 	nt.exitParentNotified = true
 	nt.exitParentAcked = true
+	nt.k.tasks.mu.Unlock()
 	nt.runState = (*runExitMain)(nil)
 }
 
@@ -62,6 +64,9 @@ func failCloneAfterTaskCreation(nt *Task) {
 // goroutine.
 func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	if args.Flags&^SupportedCloneFlags != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if !t.k.Cgroup2FS().EverMounted() && args.Flags&(linux.CLONE_NEWCGROUP|linux.CLONE_INTO_CGROUP) != 0 {
 		return 0, nil, linuxerr.EINVAL
 	}
 	// Since signal actions may refer to application signal handlers by virtual
@@ -148,7 +153,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	cu.Add(func() {
 		userns.DecRef(t)
 	})
-	if args.Flags&(linux.CLONE_NEWPID|linux.CLONE_NEWNET|linux.CLONE_NEWUTS|linux.CLONE_NEWIPC) != 0 && !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, userns) {
+	if args.Flags&(linux.CLONE_NEWPID|linux.CLONE_NEWNET|linux.CLONE_NEWUTS|linux.CLONE_NEWIPC|linux.CLONE_NEWCGROUP) != 0 && !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, userns) {
 		return 0, nil, linuxerr.EPERM
 	}
 
@@ -175,6 +180,20 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	}
 	cu.Add(func() {
 		ipcns.DecRef(t)
+	})
+
+	cgroupns := t.cgroupns
+	if args.Flags&linux.CLONE_NEWCGROUP != 0 {
+		// The new namespace is rooted at the calling task's current cgroup,
+		// even if the child is placed elsewhere via CLONE_INTO_CGROUP. See
+		// Linux's copy_cgroup_ns().
+		cgroupns = newCgroupNamespace(t.Cgroup2(), userns)
+		cgroupns.SetInode(nsfs.NewInode(t, t.k.nsfsMount, cgroupns))
+	} else {
+		cgroupns.IncRef()
+	}
+	cu.Add(func() {
+		cgroupns.DecRef(t)
 	})
 
 	netns := t.netns
@@ -283,6 +302,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		}
 		tg = t.k.NewThreadGroup(pidns, sh, termSig, tg.limits.GetCopy())
 		tg.oomScoreAdj = atomicbitops.FromInt32(t.tg.oomScoreAdj.Load())
+		tg.coredumpFilter = atomicbitops.FromUint32(t.tg.coredumpFilter.Load())
 		rseqAddr = t.rseqAddr
 		rseqSignature = t.rseqSignature
 	}
@@ -310,6 +330,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		AllowedCPUMask:   t.CPUMask(),
 		UTSNamespace:     utsns,
 		IPCNamespace:     ipcns,
+		CgroupNamespace:  cgroupns,
 		MountNamespace:   mntns,
 		RSeqAddr:         rseqAddr,
 		RSeqSignature:    rseqSignature,
@@ -318,6 +339,8 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		SessionKeyring:   sessionKeyring,
 		Personality:      t.personality.Load(),
 		Origin:           t.Origin,
+		cgroupFD:         args.Cgroup,
+		cloneIntoCgroup:  args.Flags&linux.CLONE_INTO_CGROUP != 0,
 	}
 	if args.Flags&(linux.CLONE_THREAD|linux.CLONE_PARENT) == 0 {
 		cfg.Parent = t
@@ -325,15 +348,10 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		cfg.InheritParent = t
 	}
 	if args.Flags&linux.CLONE_PIDFD != 0 {
-		if args.Flags&linux.CLONE_THREAD != 0 {
-			cfg.pidFDMode = makeThreadedPIDFD
-		} else {
-			cfg.pidFDMode = makePIDFD
-		}
-		cfg.pidFDAddr = hostarch.Addr(args.Pidfd)
+		cfg.makePIDFD = true
 	}
-	nt, pidFD, err := t.tg.pidns.owner.cloneNewTask(t, cfg)
-	// If cloneNewTask succeeds, we transfer references to nt. If cloneNewTask fails, it does
+	nt, err := t.tg.pidns.owner.NewTask(t, cfg)
+	// If NewTask succeeds, we transfer references to nt. If cloneNewTask fails, it does
 	// the cleanup for us.
 	cu.Release()
 	if err != nil {
@@ -356,6 +374,31 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	// nt that it must receive before its task goroutine starts running.
 	tid := nt.k.tasks.Root.IDOfTask(nt)
 	defer nt.Start(tid)
+
+	var pidFD int32 = -1
+	if args.Flags&linux.CLONE_PIDFD != 0 {
+		isThread := args.Flags&linux.CLONE_THREAD != 0
+		vfsfd, err := t.pidFDOpen(nt.pid, isThread, false /*nonblock*/)
+		if err != nil {
+			failCloneAfterTaskCreation(nt)
+			return 0, nil, err
+		}
+		defer vfsfd.DecRef(t)
+
+		fd, err := t.NewFDFrom(0, vfsfd, FDFlags{CloseOnExec: true})
+		if err != nil {
+			failCloneAfterTaskCreation(nt)
+			return 0, nil, err
+		}
+		pidFD = fd
+		if _, err := primitive.CopyInt32Out(t, hostarch.Addr(args.Pidfd), fd); err != nil {
+			failCloneAfterTaskCreation(nt)
+			if oldFile := t.FDTable().Remove(t, fd); oldFile != nil {
+				oldFile.DecRef(t)
+			}
+			return 0, nil, err
+		}
+	}
 
 	if seccheck.Global.Enabled(seccheck.PointClone) {
 		mask, info := getCloneSeccheckInfo(t, nt, args.Flags)
@@ -515,6 +558,7 @@ type namespaceSet struct {
 	netNS      *inet.Namespace
 	utsNS      *UTSNamespace
 	ipcNS      *IPCNamespace
+	cgroupNS   *CgroupNamespace
 	mountNS    *vfs.MountNamespace
 	userNS     *auth.UserNamespace
 
@@ -534,6 +578,9 @@ func (nss *namespaceSet) release(t *Task) {
 	if nss.ipcNS != nil {
 		nss.ipcNS.DecRef(t)
 	}
+	if nss.cgroupNS != nil {
+		nss.cgroupNS.DecRef(t)
+	}
 	if nss.mountNS != nil {
 		nss.mountNS.DecRef(t)
 	}
@@ -548,6 +595,9 @@ func (nss *namespaceSet) release(t *Task) {
 
 func (nss *namespaceSet) initFromTask(t *Task, target *Task, flags int32) error {
 	supported := uint32(linux.CLONE_NEWPID | linux.CLONE_NEWNET | linux.CLONE_NEWUTS | linux.CLONE_NEWIPC | linux.CLONE_NEWNS | linux.CLONE_NEWUSER)
+	if target.k.Cgroup2FS().EverMounted() {
+		supported |= linux.CLONE_NEWCGROUP
+	}
 	if (uint32(flags) & ^supported) != 0 || flags == 0 {
 		return linuxerr.EINVAL
 	}
@@ -608,6 +658,13 @@ func (nss *namespaceSet) initFromTask(t *Task, target *Task, flags int32) error 
 		}
 		nss.ipcNS.IncRef()
 	}
+	if flags&linux.CLONE_NEWCGROUP != 0 {
+		nss.cgroupNS = target.cgroupns
+		if nss.cgroupNS == nil {
+			return linuxerr.ESRCH
+		}
+		nss.cgroupNS.IncRef()
+	}
 	if flags&linux.CLONE_NEWNS != 0 {
 		nss.mountNS = target.mountNamespace
 		if nss.mountNS == nil {
@@ -645,6 +702,12 @@ func (nss *namespaceSet) initFromNS(ns vfs.Namespace, flags int32) error {
 		}
 		nss.ipcNS = ns
 		ns.IncRef()
+	case *CgroupNamespace:
+		if flags != 0 && flags != linux.CLONE_NEWCGROUP {
+			return linuxerr.EINVAL
+		}
+		nss.cgroupNS = ns
+		ns.IncRef()
 	case *vfs.MountNamespace:
 		if flags != 0 && flags != linux.CLONE_NEWNS {
 			return linuxerr.EINVAL
@@ -666,6 +729,9 @@ func (nss *namespaceSet) initFromNS(ns vfs.Namespace, flags int32) error {
 
 // Setns reassociates task t with the specified namespace(s).
 func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
+	if !t.k.Cgroup2FS().EverMounted() && flags&linux.CLONE_NEWCGROUP != 0 {
+		return linuxerr.EINVAL
+	}
 	var nss namespaceSet
 	defer nss.release(t)
 
@@ -685,6 +751,9 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		i, ok := d.Inode().(*nsfs.Inode)
 		if !ok {
 			return linuxerr.EINVAL // Linux returns EINVAL in this case.
+		}
+		if _, ok := i.Namespace().(*CgroupNamespace); ok && !t.k.Cgroup2FS().EverMounted() {
+			return linuxerr.EINVAL
 		}
 		if err := nss.initFromNS(i.Namespace(), flags); err != nil {
 			return err
@@ -749,6 +818,12 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		}
 	}
 
+	if nss.cgroupNS != nil {
+		if !checkCreds.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.cgroupNS.UserNamespace()) || !checkCreds.HasSelfCapability(linux.CAP_SYS_ADMIN) {
+			return linuxerr.EPERM
+		}
+	}
+
 	if nss.mountNS != nil {
 		if !checkCreds.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.mountNS.UserNamespace()) || !checkCreds.HasSelfCapability(linux.CAP_SYS_CHROOT) || !checkCreds.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
@@ -785,6 +860,9 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 	}
 	if nss.ipcNS != nil {
 		t.ipcns, nss.ipcNS = nss.ipcNS, t.ipcns
+	}
+	if nss.cgroupNS != nil {
+		t.cgroupns, nss.cgroupNS = nss.cgroupNS, t.cgroupns
 	}
 	if nss.mountNS != nil {
 		t.mountNamespace, nss.mountNS = nss.mountNS, t.mountNamespace
@@ -824,6 +902,9 @@ func (t *Task) Unshare(flags int32) error {
 	if flags&(linux.CLONE_VM|linux.CLONE_SIGHAND) != 0 {
 		return linuxerr.EINVAL
 	}
+	if !t.k.Cgroup2FS().EverMounted() && flags&linux.CLONE_NEWCGROUP != 0 {
+		return linuxerr.EINVAL
+	}
 	if flags&linux.CLONE_THREAD != 0 {
 		t.tg.signalHandlers.mu.Lock()
 		if t.tg.tasksCount != 1 {
@@ -847,6 +928,7 @@ func (t *Task) Unshare(flags int32) error {
 		newNetNS      *inet.Namespace
 		newUTSNS      *UTSNamespace
 		newIPCNS      *IPCNamespace
+		newCgroupNS   *CgroupNamespace
 		newMountNS    *vfs.MountNamespace
 	)
 	defer func() {
@@ -867,6 +949,9 @@ func (t *Task) Unshare(flags int32) error {
 		}
 		if newIPCNS != nil {
 			newIPCNS.DecRef(t)
+		}
+		if newCgroupNS != nil {
+			newCgroupNS.DecRef(t)
 		}
 		if newMountNS != nil {
 			newMountNS.DecRef(t)
@@ -891,7 +976,7 @@ func (t *Task) Unshare(flags int32) error {
 		creds = t.Credentials().ForkIntoUserNamespace(newUserNS)
 		newCreds = true
 	}
-	if flags&(linux.CLONE_NEWPID|linux.CLONE_NEWNET|linux.CLONE_NEWUTS|linux.CLONE_NEWIPC|linux.CLONE_NEWNS) != 0 {
+	if flags&(linux.CLONE_NEWPID|linux.CLONE_NEWNET|linux.CLONE_NEWUTS|linux.CLONE_NEWIPC|linux.CLONE_NEWCGROUP|linux.CLONE_NEWNS) != 0 {
 		if !creds.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
 		}
@@ -911,6 +996,10 @@ func (t *Task) Unshare(flags int32) error {
 		newIPCNS = NewIPCNamespace(creds.UserNamespace)
 		newIPCNS.InitPosixQueues(t, t.k.VFS(), creds)
 		newIPCNS.SetInode(nsfs.NewInode(t, t.k.nsfsMount, newIPCNS))
+	}
+	if flags&linux.CLONE_NEWCGROUP != 0 {
+		newCgroupNS = newCgroupNamespace(t.Cgroup2(), creds.UserNamespace)
+		newCgroupNS.SetInode(nsfs.NewInode(t, t.k.nsfsMount, newCgroupNS))
 	}
 	if flags&linux.CLONE_NEWNS != 0 {
 		fsContext := newFSContext
@@ -956,6 +1045,9 @@ func (t *Task) Unshare(flags int32) error {
 	}
 	if newIPCNS != nil {
 		t.ipcns, newIPCNS = newIPCNS, t.ipcns
+	}
+	if newCgroupNS != nil {
+		t.cgroupns, newCgroupNS = newCgroupNS, t.cgroupns
 	}
 	if newMountNS != nil {
 		t.mountNamespace, newMountNS = newMountNS, t.mountNamespace

@@ -300,6 +300,13 @@ type Task struct {
 	// fdTable is protected by mu, and is owned by the task goroutine.
 	fdTable *FDTable
 
+	// userDumpable caches the dumpability state of the task's MemoryManager
+	// before it is cleared during process exit. This cached state is used to perform
+	// ptrace access checks after the MemoryManager has been released.
+	//
+	// userDumpable is protected by mu.
+	userDumpable bool
+
 	// If vforkParent is not nil, it is the task that created this task with
 	// vfork() or clone(CLONE_VFORK), and should have its vforkStop ended when
 	// this TaskImage is released.
@@ -475,6 +482,11 @@ type Task struct {
 	// ipcns is protected by mu. ipcns is owned by the task goroutine.
 	ipcns *IPCNamespace
 
+	// cgroupns is the task's cgroup namespace.
+	//
+	// cgroupns is protected by mu. cgroupns is owned by the task goroutine.
+	cgroupns *CgroupNamespace
+
 	// mountNamespace is the task's mount namespace.
 	//
 	// It is protected by mu. It is owned by the task goroutine.
@@ -512,6 +524,13 @@ type Task struct {
 	// entirely if Kernel.useHostCores is true.
 	cpu atomicbitops.Int32
 
+	// This is used to keep track of the scheduling policy for this task.
+	// It has no effect and is only used to provide a reasonable return value for
+	// sched_getattr() and similar.
+	//
+	// scheduler is protected by mu.
+	scheduler uint
+
 	// This is used to keep track of changes made to a process' priority/niceness.
 	// It is mostly used to provide some reasonable return value from
 	// getpriority(2) after a call to setpriority(2) has been made.
@@ -521,6 +540,12 @@ type Task struct {
 	//
 	// niceness is protected by mu.
 	niceness int
+
+	// This is used to keep track of a process's IO class and priority.
+	// It is only used to provide a reasonable return value for ioprio_get().
+	//
+	// ioprio is protected by mu.
+	ioprio int
 
 	// This is used to track the numa policy for the current thread. This can be
 	// modified through a set_mempolicy(2) syscall. Since we always report a
@@ -620,6 +645,14 @@ type Task struct {
 	//
 	// +checklocks:mu
 	cgroups map[Cgroup]struct{}
+
+	// cgroup2 is the cgroup v2 node this task belongs to.
+	// Protected by cgroup2Mu.
+	// +checklocks:cgroup2Mu
+	cgroup2 Cgroup2
+
+	// cgroup2Mu protects the cgroup2 field.
+	cgroup2Mu cgroup2Mutex `state:"nosave"`
 
 	// memCgID is the memory cgroup id.
 	memCgID atomicbitops.Uint32
@@ -914,4 +947,14 @@ func (t *Task) Personality() uint32 {
 // It returns the task's former personality.
 func (t *Task) SetPersonality(personality uint32) uint32 {
 	return t.personality.Swap(personality)
+}
+
+// SetCoredumpFilter sets the task's coredump filter.
+func (t *Task) SetCoredumpFilter(coredumpFilter uint32) {
+	t.tg.coredumpFilter.Store(coredumpFilter)
+}
+
+// GetCoredumpFilter returns the task's coredump filter.
+func (t *Task) GetCoredumpFilter() uint32 {
+	return t.tg.coredumpFilter.Load()
 }

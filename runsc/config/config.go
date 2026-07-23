@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -39,7 +40,7 @@ import (
 //  1. Create a new field in Config.
 //  2. Add a field tag with the flag name
 //  3. Register a new flag in flags.go, with same name and add a description
-//  4. Add any necessary validation into validate()
+//  4. Add any necessary validation into Validate()
 //  5. If adding an enum, follow the same pattern as FileAccessType
 //  6. Evaluate if the flag can be changed with OCI annotations. See
 //     overrideAllowlist for more details
@@ -181,6 +182,10 @@ type Config struct {
 	// The value of this flag must also match across the two command lines.
 	MetricServer string `flag:"metric-server"`
 
+	// SidecarReleaseEnforcementPolicy controls when spawned sidecar binaries
+	// must match `runsc`'s build label.
+	SidecarReleaseEnforcementPolicy SidecarPolicy `flag:"sidecar-release-enforcement-policy"`
+
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
 	FinalMetricsLog string `flag:"final-metrics-log"`
@@ -304,6 +309,9 @@ type Config struct {
 	// Don't configure cgroups.
 	IgnoreCgroups bool `flag:"ignore-cgroups"`
 
+	// Mount cgroup v2 instead of cgroup v1 inside the sandbox.
+	MountCgroupV2 bool `flag:"mount-cgroup-v2"`
+
 	// Use systemd to configure cgroups.
 	SystemdCgroup bool `flag:"systemd-cgroup"`
 
@@ -356,6 +364,10 @@ type Config struct {
 	// NVProxyAllowUnsupportedCapabilities is a comma-separated list of driver
 	// capabilities that are allowed to be requested by the container.
 	NVProxyAllowedDriverCapabilities string `flag:"nvproxy-allowed-driver-capabilities"`
+
+	// NVProxyAllowUnsupportedDriver allows nvproxy to be initialized with an
+	// unsupported driver version.
+	NVProxyAllowUnsupportedDriver bool `flag:"nvproxy-allow-unsupported-driver"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
@@ -415,6 +427,9 @@ type Config struct {
 	// SystrapDisableSyscallPatching disables syscall patching in Systrap.
 	SystrapDisableSyscallPatching bool `flag:"systrap-disable-syscall-patching"`
 
+	// SystrapDisableFastPath disables the Systrap fast path entirely.
+	SystrapDisableFastPath bool `flag:"systrap-disable-fast-path"`
+
 	// Nftables enables support for nftables to be used instead of iptables.
 	Nftables bool `flag:"TESTONLY-nftables"`
 
@@ -448,7 +463,11 @@ type Config struct {
 	ControlRPCStopTimeout time.Duration `flag:"control-rpc-stop-timeout"`
 }
 
-func (c *Config) validate() error {
+// Validate checks that the Config is in a consistent state, e.g. that no
+// interdependent or mutually-exclusive flag values conflict. Note that
+// Config.Override does not validate, so callers must call Validate once they
+// are done overriding.
+func (c *Config) Validate() error {
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")
@@ -1194,6 +1213,57 @@ func (p HostSettingsPolicy) String() string {
 	default:
 		panic(fmt.Sprintf("Invalid host settings policy %d", p))
 	}
+}
+
+// SidecarPolicy controls when a sidecar-related action applies.
+type SidecarPolicy string
+
+// SidecarPolicy values.
+const (
+	SidecarNever          SidecarPolicy = "NEVER"
+	SidecarAlways         SidecarPolicy = "ALWAYS"
+	SidecarIfReleaseBuild SidecarPolicy = "IF_RELEASE_BUILD"
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *SidecarPolicy) Set(v string) error {
+	sp := SidecarPolicy(strings.ToUpper(v))
+	switch sp {
+	case SidecarNever, SidecarAlways, SidecarIfReleaseBuild:
+		*p = sp
+		return nil
+	}
+	return fmt.Errorf("invalid value %q; must be %s, %s, or %s", v, SidecarNever, SidecarAlways, SidecarIfReleaseBuild)
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p SidecarPolicy) Ptr() *SidecarPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *SidecarPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p SidecarPolicy) String() string {
+	return string(p)
+}
+
+// Applies returns whether the policy is in effect for this runsc build.
+func (p SidecarPolicy) Applies() bool {
+	return p == SidecarAlways || (p == SidecarIfReleaseBuild && IsReleaseVersion(version.Version()))
+}
+
+// releaseVersionRE matches the version strings of production release builds:
+// a `release-` or `g<lowercase>-` prefix, then the release date.
+var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$`)
+
+// IsReleaseVersion returns whether ver is a tagged-release version string.
+func IsReleaseVersion(ver string) bool {
+	return releaseVersionRE.MatchString(ver)
 }
 
 // RestoreSpecValidationPolicy dictates how spec validation should be handled.

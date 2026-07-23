@@ -116,12 +116,18 @@ func (nf *NFTables) evaluateNATBaseChains(pkt *stack.PacketBuffer, route *stack.
 	if err != nil {
 		return err, false
 	}
+	evalCtx := opEvalCtx{
+		pkt:      pkt,
+		route:    route,
+		hook:     hook,
+		nftState: nf,
+	}
 	for _, bc := range baseChains {
 		if _, dormant := bc.table.flagSet[TableFlagDormant]; dormant {
 			continue
 		}
 		// Evaluate the packet through the base chain.
-		if err := bc.evaluate(regs, pkt); err != nil {
+		if err := bc.evaluate(regs, evalCtx); err != nil {
 			return err, false
 		}
 		// If the verdict is a terminal code, NAT will not be configured for this
@@ -189,7 +195,6 @@ func (nf *NFTables) getExtraEvaluators(family stack.AddressFamily, hook stack.NF
 						return syserr.NewAnnotatedError(syserr.ErrInvalidArgument, fmt.Sprintf("Nftables: failed to finalize connTrack for packet: %v", pkt))
 					}
 				}
-				regs.verdict.Code = VC(linux.NFT_CONTINUE)
 				return nil
 			}})
 	}
@@ -276,7 +281,12 @@ func (nf *NFTables) EvaluateHook(family stack.AddressFamily, hook stack.NFHook, 
 		return stack.NFVerdict{Code: VC(linux.NF_ACCEPT)}, nil
 	}
 	var lastEvaluatedChain *Chain
-
+	evalCtx := opEvalCtx{
+		pkt:      pkt,
+		route:    route,
+		hook:     hook,
+		nftState: nf,
+	}
 	// Evaluate base chains and extra evaluators in priority order.
 	for ei < numExtraHooks || ci < numBaseChains {
 		selectExtra := (ci == numBaseChains) || (ei < numExtraHooks && extraEvaluators[ei].priority < baseChains[ci].GetBaseChainInfo().Priority.GetValue())
@@ -292,7 +302,7 @@ func (nf *NFTables) EvaluateHook(family stack.AddressFamily, hook stack.NFHook, 
 			if _, dormant := bc.table.flagSet[TableFlagDormant]; dormant {
 				continue
 			}
-			if err := bc.evaluate(&regs, pkt); err != nil {
+			if err := bc.evaluate(&regs, evalCtx); err != nil {
 				return stack.NFVerdict{}, err
 			}
 			lastEvaluatedChain = bc
@@ -321,7 +331,7 @@ func (nf *NFTables) EvaluateHook(family stack.AddressFamily, hook stack.NFHook, 
 
 // evaluateFromRule is a helper function for Chain.evaluate that evaluates the
 // packet through the rules in the chain starting at the specified rule index.
-func (c *Chain) evaluateFromRule(rIdx int, jumpDepth int, regs *registerSet, pkt *stack.PacketBuffer) *syserr.AnnotatedError {
+func (c *Chain) evaluateFromRule(rIdx int, jumpDepth int, regs *registerSet, evalCtx opEvalCtx) *syserr.AnnotatedError {
 	if jumpDepth >= nestedJumpLimit {
 		return syserr.NewAnnotatedError(syserr.ErrTooManyLinks, fmt.Sprintf("exceeded nested jump limit of %d", nestedJumpLimit))
 	}
@@ -333,7 +343,8 @@ func (c *Chain) evaluateFromRule(rIdx int, jumpDepth int, regs *registerSet, pkt
 evalLoop:
 	for ; rIdx < len(c.rules); rIdx++ {
 		rule := c.rules[rIdx]
-		if err := rule.evaluate(regs, pkt); err != nil {
+		evalCtx.rule = rule
+		if err := rule.evaluate(regs, evalCtx); err != nil {
 			return err
 		}
 
@@ -350,7 +361,7 @@ evalLoop:
 			if !exists {
 				return syserr.NewAnnotatedError(syserr.ErrInvalidArgument, fmt.Sprintf("chain %s not found in table %s", regs.verdict.ChainName, c.table.name))
 			}
-			if err := nextChain.evaluateFromRule(0, jumpDepth, regs, pkt); err != nil {
+			if err := nextChain.evaluateFromRule(0, jumpDepth, regs, evalCtx); err != nil {
 				return err
 			}
 			// Ends evaluation for goto (and continues evaluation for jump).
@@ -378,17 +389,17 @@ evalLoop:
 
 // evaluate for Chain evaluates the packet through the chain's rules and returns
 // the verdict and modifies the packet in place.
-func (c *Chain) evaluate(regs *registerSet, pkt *stack.PacketBuffer) *syserr.AnnotatedError {
-	return c.evaluateFromRule(0, 0, regs, pkt)
+func (c *Chain) evaluate(regs *registerSet, evalCtx opEvalCtx) *syserr.AnnotatedError {
+	return c.evaluateFromRule(0, 0, regs, evalCtx)
 }
 
 // evaluate evaluates the rule on the given packet and register set, changing
 // the register set and possibly the packet in place.
 // The verdict in regs.Verdict() may be an nf table internal verdict or a
 // netfilter terminal verdict.
-func (r *Rule) evaluate(regs *registerSet, pkt *stack.PacketBuffer) *syserr.AnnotatedError {
+func (r *Rule) evaluate(regs *registerSet, evalCtx opEvalCtx) *syserr.AnnotatedError {
 	for _, op := range r.ops {
-		op.evaluate(regs, pkt, r)
+		op.evaluate(regs, evalCtx)
 		if regs.Verdict().Code != VC(linux.NFT_CONTINUE) {
 			break
 		}
@@ -405,14 +416,14 @@ func (r *Rule) evaluate(regs *registerSet, pkt *stack.PacketBuffer) *syserr.Anno
 // NewNFTables creates a new NFTables state object using the given clock for
 // timing operations.
 // Note: Expects random number generator to be initialized with a seed.
-func NewNFTables(clock tcpip.Clock, rng rand.RNG) *NFTables {
+func NewNFTables(stack *stack.Stack, clock tcpip.Clock, rng rand.RNG) *NFTables {
 	if clock == nil {
 		panic("nftables state must be initialized with a non-nil clock")
 	}
 	if rng.Reader == nil {
 		panic("nftables state must be initialized with a non-nil random number generator")
 	}
-	return &NFTables{clock: clock, startTime: clock.Now(), rng: rng, tableHandleCounter: atomicbitops.Uint64{}, genid: 1}
+	return &NFTables{stack: stack, clock: clock, startTime: clock.Now(), rng: rng, tableHandleCounter: atomicbitops.Uint64{}, genid: 1}
 }
 
 // GetGenID returns the generation ID for the NFTables object.
@@ -597,6 +608,8 @@ func (nf *NFTables) AddTable(family stack.AddressFamily, name string,
 		flagSet:       make(map[TableFlag]struct{}),
 		handle:        nf.getNewTableHandle(),
 		handleCounter: atomicbitops.Uint64{},
+		sets:          make(map[string]*nftSet),
+		setHandles:    make(map[uint64]*nftSet),
 	}
 	tableMap[name] = t
 	tableHandleMap[t.handle] = t
@@ -1162,6 +1175,9 @@ func (c *Chain) RegisterRule(rule *Rule, index int) *syserr.AnnotatedError {
 
 	// Checks if there are loops from all jump and goto operations in the rule.
 	for _, op := range rule.ops {
+		if err := op.checkCompatibility(&opCompatCtx{chain: c}); err != nil {
+			return err
+		}
 		isJumpOrGoto, targetChainName := isJumpOrGotoOperation(op)
 		if !isJumpOrGoto {
 			continue
@@ -1350,7 +1366,7 @@ func (r *Rule) addOperation(op operation) *syserr.AnnotatedError {
 }
 
 // AddOpFromExprInfo adds an operation to the rule given the expression information.
-func (r *Rule) AddOpFromExprInfo(tab *Table, exprInfo ExprInfo) *syserr.AnnotatedError {
+func (r *Rule) AddOpFromExprInfo(nf *NFTables, tab *Table, exprInfo ExprInfo) *syserr.AnnotatedError {
 	// Centralized here so that operations can do their own validation when being created.
 	var op operation
 	var err *syserr.AnnotatedError
@@ -1364,6 +1380,10 @@ func (r *Rule) AddOpFromExprInfo(tab *Table, exprInfo ExprInfo) *syserr.Annotate
 		if op, err = initPayload(tab, exprInfo); err != nil {
 			return err
 		}
+	case OpTypeBitwise:
+		if op, err = initBitwise(tab, exprInfo); err != nil {
+			return err
+		}
 	case OpTypeMeta:
 		if op, err = initMeta(tab, exprInfo); err != nil {
 			return err
@@ -1373,16 +1393,37 @@ func (r *Rule) AddOpFromExprInfo(tab *Table, exprInfo ExprInfo) *syserr.Annotate
 			return err
 		}
 	case OpTypeCounter:
-		if op, err = initCounter(tab, exprInfo); err != nil {
+		if op, err = initCounter(exprInfo); err != nil {
 			return err
 		}
 	case OpTypeNAT:
 		if op, err = initNATOp(tab, exprInfo); err != nil {
 			return err
 		}
+	case OpTypeLookup:
+		if op, err = initLookup(tab, exprInfo); err != nil {
+			return err
+		}
+	case OpTypeFIB:
+		if op, err = initFIB(tab, exprInfo); err != nil {
+			return err
+		}
+	case OpTypeCT:
+		if op, err = initCT(tab, exprInfo); err != nil {
+			return err
+		}
+	case OpTypeMasq:
+		if op, err = initMasqOp(tab, exprInfo); err != nil {
+			return err
+		}
 
 	default:
 		return syserr.NewAnnotatedError(syserr.ErrNoFileOrDir, fmt.Sprintf("Nftables: Unknown expression type not found: %s", exprInfo.ExprName))
+	}
+
+	if exprOpType == OpTypeCT || exprOpType == OpTypeNAT || exprOpType == OpTypeMasq {
+		// NAT and Masq operations require connection tracking.
+		nf.InitConnTrackOnce()
 	}
 
 	return r.addOperation(op)
@@ -1487,4 +1528,74 @@ func (hfStack *hookFunctionStack) detachBaseChain(name string) *syserr.Annotated
 		return nil
 	}
 	return syserr.NewAnnotatedError(syserr.ErrNoFileOrDir, fmt.Sprintf("failed to detach base chain: %s, chain not found", name))
+}
+
+//
+// NFTables Parser functions
+//
+
+// ParseExpr parses the expression attributes and returns the expression information.
+func (nf *NFTables) ParseExpr(attrs nlmsg.AttrsView) (*ExprInfo, *syserr.AnnotatedError) {
+	exprAttrs, ok := NfParse(attrs)
+	if !ok {
+		return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Failed to parse attributes for expression")
+	}
+
+	exprNameBytes, ok := exprAttrs[linux.NFTA_EXPR_NAME]
+	if !ok {
+		return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: NFTA_EXPR_NAME attribute is malformed or not found")
+	}
+
+	// exprData holds the expression data for a specific operation.
+	exprData := nlmsg.AttrsView{}
+	// Only assign exprData if the data is present. Later validation will
+	// check if it is needed for the specific operation type.
+	// From linux/net/netfilter/nf_tables_api.c: nf_tables_expr_parse
+	if exprDataBytes, ok := exprAttrs[linux.NFTA_EXPR_DATA]; ok {
+		exprData = nlmsg.AttrsView(exprDataBytes)
+	}
+
+	return &ExprInfo{
+		ExprName: exprNameBytes.String(),
+		ExprData: exprData,
+	}, nil
+}
+
+// ParseNestedExprs parses the rule expressions attributes and adds the
+// operations to the rule.
+func (nf *NFTables) ParseNestedExprs(nestedAttrBytes nlmsg.AttrsView, maxExprs int) ([]ExprInfo, *syserr.AnnotatedError) {
+	// Netlink message structure for rule expressions (NFTA_RULE_EXPRESSIONS):
+	//
+	// [ NFTA_RULE_EXPRESSIONS (Outer Array Container) ]
+	//   ├── [ NFTA_LIST_ELEM (Element Wrapper #1) ]
+	//   │     ├── [ NFTA_EXPR_NAME ] (e.g., "counter")
+	//   │     └── [ NFTA_EXPR_DATA ] (Expression-specific attributes)
+	//   │
+	//   └── [ NFTA_LIST_ELEM (Element Wrapper #2) ]
+	//         ├── [ NFTA_EXPR_NAME ] (e.g., "cmp")
+	//         └── [ NFTA_EXPR_DATA ] (Expression-specific attributes)
+	var exprInfos []ExprInfo
+	numExprs := 0
+	for !nestedAttrBytes.Empty() {
+		hdr, value, rest, ok := nestedAttrBytes.ParseFirst()
+		if !ok {
+			return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Failed to parse list attribute for rules")
+		}
+
+		nestedAttrBytes = rest
+		if hdr.Type&linux.NLA_TYPE_MASK != linux.NFTA_LIST_ELEM {
+			return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: parsed attribute is not of type NFTA_LIST_ELEM")
+		}
+
+		if numExprs == maxExprs {
+			return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Too many expressions specified for rule")
+		}
+		numExprs++
+		exprInfo, err := nf.ParseExpr(value)
+		if err != nil {
+			return nil, err
+		}
+		exprInfos = append(exprInfos, *exprInfo)
+	}
+	return exprInfos, nil
 }

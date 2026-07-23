@@ -154,6 +154,12 @@ func archInit() {
 			Name: "fd_path",
 		},
 	})
+	addSyscallPoint(201, "listen", []FieldDesc{
+		{
+			ID:   FieldSyscallPath,
+			Name: "fd_path",
+		},
+	})
 	addSyscallPoint(202, "accept", []FieldDesc{
 		{
 			ID:   FieldSyscallPath,
@@ -171,6 +177,12 @@ func archInit() {
 		{
 			ID:   FieldSyscallExecveEnvv,
 			Name: "envv",
+		},
+	})
+	addSyscallPoint(222, "mmap", []FieldDesc{
+		{
+			ID:   FieldSyscallPath,
+			Name: "fd_path",
 		},
 	})
 	addSyscallPoint(242, "accept4", []FieldDesc{

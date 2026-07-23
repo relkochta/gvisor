@@ -15,6 +15,7 @@
 package nftables
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -2213,63 +2214,63 @@ func TestEvaluateBitwise(t *testing.T) {
 		// No nft binary commands were observed that directly used shift operations.
 		{
 			tname: "0 shift left for bitwise lshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG32_01, numToBE(4783, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG32_01, binary.NativeEndian.AppendUint32(nil, 4783), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG32_01, linux.NFT_REG32_01, 4, 0, false),
-			op3:   mustCreateComparison(t, linux.NFT_REG32_01, linux.NFT_CMP_EQ, numToBE(4783, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG32_01, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 4783)),
 		},
 		{
 			tname: "0 shift right for bitwise rshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG_1, numToBE(4783, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG_1, binary.NativeEndian.AppendUint32(nil, 4783), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG_1, linux.NFT_REG_1, 4, 0, true),
-			op3:   mustCreateComparison(t, linux.NFT_REG_1, linux.NFT_CMP_EQ, numToBE(4783, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG_1, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 4783)),
 		},
 		{
 			tname: "1-bit shift left for bitwise lshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG_4, numToBE(4782, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG_4, binary.NativeEndian.AppendUint32(nil, 4782), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG_4, linux.NFT_REG_4, 4, 1, false),
-			op3:   mustCreateComparison(t, linux.NFT_REG_4, linux.NFT_CMP_EQ, numToBE(4782<<1, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG_4, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 4782<<1)),
 		},
 		{
 			tname: "1-bit shift right for bitwise rshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG32_06, numToBE(4782, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG32_06, binary.NativeEndian.AppendUint32(nil, 4782), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG32_06, linux.NFT_REG32_06, 4, 1, true),
-			op3:   mustCreateComparison(t, linux.NFT_REG32_06, linux.NFT_CMP_EQ, numToBE(4782>>1, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG32_06, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 4782>>1)),
 		},
 		{
 			tname: "8-bit shift left for bitwise lshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG_4, numToBE(4782, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG_4, binary.NativeEndian.AppendUint32(nil, 4782), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG_4, linux.NFT_REG_4, 4, 8, false),
-			op3:   mustCreateComparison(t, linux.NFT_REG_4, linux.NFT_CMP_EQ, numToBE(4782<<8, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG_4, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 4782<<8)),
 		},
 		{
 			tname: "8-bit shift right for bitwise rshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG32_06, numToBE(4782, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG32_06, binary.NativeEndian.AppendUint32(nil, 4782), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG32_06, linux.NFT_REG32_06, 4, 8, true),
-			op3:   mustCreateComparison(t, linux.NFT_REG32_06, linux.NFT_CMP_EQ, numToBE(4782>>8, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG32_06, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 4782>>8)),
 		},
 		{
 			tname: "16-bit shift left for bitwise lshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG_4, numToBE(0x45678910, 8), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG_4, append(binary.NativeEndian.AppendUint32(nil, 0), binary.NativeEndian.AppendUint32(nil, 0x45678910)...), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG_4, linux.NFT_REG_4, 8, 16, false),
-			op3:   mustCreateComparison(t, linux.NFT_REG_4, linux.NFT_CMP_EQ, numToBE(0x45678910<<16, 8)),
+			op3:   mustCreateComparison(t, linux.NFT_REG_4, linux.NFT_CMP_EQ, append(binary.NativeEndian.AppendUint32(nil, 0x00004567), binary.NativeEndian.AppendUint32(nil, 0x89100000)...)),
 		},
 		{
 			tname: "16-bit shift right for bitwise rshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG32_06, numToBE(0x45678910, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG32_06, binary.NativeEndian.AppendUint32(nil, 0x45678910), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG32_06, linux.NFT_REG32_06, 4, 16, true),
-			op3:   mustCreateComparison(t, linux.NFT_REG32_06, linux.NFT_CMP_EQ, numToBE(0x45678910>>16, 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG32_06, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 0x45678910>>16)),
 		},
 		{
 			tname: "max-bit shift left for bitwise lshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG32_03, numToBE(0x45678910, 4), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG32_03, binary.NativeEndian.AppendUint32(nil, 0x45678910), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG32_03, linux.NFT_REG_2, 4, bitshiftLimit-1, false),
-			op3:   mustCreateComparison(t, linux.NFT_REG_2, linux.NFT_CMP_EQ, numToBE(0x45678910<<(bitshiftLimit-1), 4)),
+			op3:   mustCreateComparison(t, linux.NFT_REG_2, linux.NFT_CMP_EQ, binary.NativeEndian.AppendUint32(nil, 0)), // 0x45678910 << 31 in 32-bit is 0
 		},
 		{
 			tname: "max-bit shift right for bitwise rshift",
-			op1:   mustCreateImmediate(t, linux.NFT_REG_3, numToBE(0x45678910, 8), stack.NFVerdict{}),
+			op1:   mustCreateImmediate(t, linux.NFT_REG_3, append(binary.NativeEndian.AppendUint32(nil, 0x45678910), binary.NativeEndian.AppendUint32(nil, 0)...), stack.NFVerdict{}),
 			op2:   mustCreateBitwiseShift(t, linux.NFT_REG_3, linux.NFT_REG_2, 8, bitshiftLimit-1, true),
-			op3:   mustCreateComparison(t, linux.NFT_REG_2, linux.NFT_CMP_EQ, numToBE(0x45678910>>(bitshiftLimit-1), 8)),
+			op3:   mustCreateComparison(t, linux.NFT_REG_2, linux.NFT_CMP_EQ, append(binary.NativeEndian.AppendUint32(nil, 0), binary.NativeEndian.AppendUint32(nil, 0x8ACF1220)...)),
 		},
 	} {
 		t.Run(test.tname, func(t *testing.T) {
@@ -2407,7 +2408,7 @@ func TestEvaluateLast(t *testing.T) {
 		// Sets up an NFTables object with a base chain and fake manual clock.
 		fakeClock := faketime.NewManualClock()
 		fixedRNG := rand.RNGFrom(&fixedReader{})
-		nf := NewNFTables(fakeClock, fixedRNG)
+		nf := NewNFTables(nil /* stack */, fakeClock, fixedRNG)
 		tab, err := nf.AddTable(arbitraryFamily, "test", false)
 		if err != nil {
 			t.Fatalf("unexpected error for AddTable: %v", err)
@@ -2954,7 +2955,7 @@ func TestEvaluateMetaLoad(t *testing.T) {
 		t.Run(test.tname, func(t *testing.T) {
 			// Sets up an NFTables object with a base chain and fake manual clock.
 			// Using Manual Clock sets time.Now to Unix Epoch which fixes rng seed!
-			nf := NewNFTables(fakeClock, rand.RNGFrom(&fixedReader{}))
+			nf := NewNFTables(nil /* stack */, fakeClock, rand.RNGFrom(&fixedReader{}))
 
 			tab, err := nf.AddTable(arbitraryFamily, "test", false)
 			if err != nil {
@@ -3753,7 +3754,7 @@ func packetResultString(initial, final *stack.PacketBuffer) string {
 func newNFTablesStd() *NFTables {
 	stdClock := tcpip.NewStdClock()
 	fixedRNG := rand.RNGFrom(&fixedReader{})
-	return NewNFTables(stdClock, fixedRNG)
+	return NewNFTables(nil /* stack */, stdClock, fixedRNG)
 }
 
 // mustCreateImmediate wraps the newImmediate function for brevity.
@@ -3804,7 +3805,7 @@ func mustCreatePayloadSet(t *testing.T, base payloadBase, offset uint8, len uint
 
 // mustCreateBitwiseBool wraps the newBitwiseBool function for brevity.
 func mustCreateBitwiseBool(t *testing.T, sreg, dreg uint8, mask, xor []byte) *bitwise {
-	bit, err := newBitwiseBool(sreg, dreg, mask, xor)
+	bit, err := newBitwiseBool(sreg, dreg, mask, xor, len(mask))
 	if err != nil {
 		t.Fatalf("failed to create bitwise bool: %v", err)
 	}
@@ -3948,12 +3949,12 @@ func TestNfAttrParser(t *testing.T) {
 			if !ok {
 				t.Fatalf("GetData() failed for msg %v", test.msg)
 			}
-			got, gotOk := NfParseWithOpts(attr, &NfParseOpts{Policy: test.policy})
-			wantOk := test.want != nil
-			if wantOk != gotOk {
-				t.Fatalf("NfParseWithOpts() failed, want ok: %v, got ok: %v", wantOk, gotOk)
+			got, gotErr := NfParseWithOpts(attr, &NfParseOpts{Policy: test.policy})
+			wantErr := test.want == nil
+			if wantErr && gotErr == nil {
+				t.Fatalf("NfParseWithOpts() failed, want error, got nil error")
 			}
-			if !wantOk {
+			if gotErr != nil {
 				return
 			}
 			if diff := cmp.Diff(test.want, got); diff != "" {
@@ -4138,12 +4139,12 @@ func TestNfAttrParserNestedArray(t *testing.T) {
 			if !ok {
 				t.Fatalf("GetData() failed for msg %v", msg)
 			}
-			got, gotOk := NfParseWithOpts(attr, &NfParseOpts{Policy: policy})
-			wantOk := want != nil
-			if wantOk != gotOk {
-				t.Fatalf("NfParseWithOpts() failed, want ok: %v, got ok: %v", wantOk, gotOk)
+			got, gotErr := NfParseWithOpts(attr, &NfParseOpts{Policy: policy})
+			wantErr := want == nil
+			if wantErr && gotErr == nil {
+				t.Fatalf("NfParseWithOpts() failed, want error, got nil error")
 			}
-			if !wantOk {
+			if gotErr != nil {
 				return
 			}
 			if diff := cmp.Diff(want, got); diff != "" {
@@ -4433,10 +4434,71 @@ func TestDumpOperations(t *testing.T) {
 			name: "bitwise",
 			op:   mustCreateBitwiseBool(t, linux.NFT_REG_1, linux.NFT_REG_2, []byte{0xff}, []byte{0x00}),
 			validate: func(dump []byte) error {
-				// TODO: b/452648112 - Implement validation for bitwise operation when dump is implemented.
-				if dump != nil {
-					return fmt.Errorf("unexpected dump: %v, want nil", dump)
+				attrs, ok := NfParse(dump)
+				if !ok {
+					return fmt.Errorf("failed to parse dumped attributes")
 				}
+				sreg, ok := AttrNetToHost[uint32](linux.NFTA_BITWISE_SREG, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get sreg")
+				}
+				if sreg != linux.NFT_REG_1 {
+					return fmt.Errorf("unexpected sreg: %d, want %d", sreg, linux.NFT_REG_1)
+				}
+				dreg, ok := AttrNetToHost[uint32](linux.NFTA_BITWISE_DREG, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get dreg")
+				}
+				if dreg != linux.NFT_REG_2 {
+					return fmt.Errorf("unexpected dreg: %d, want %d", dreg, linux.NFT_REG_2)
+				}
+				lenAttr, ok := AttrNetToHost[uint32](linux.NFTA_BITWISE_LEN, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get len")
+				}
+				if lenAttr != 1 {
+					return fmt.Errorf("unexpected len: %d, want %d", lenAttr, 1)
+				}
+				bop, ok := AttrNetToHost[uint32](linux.NFTA_BITWISE_OP, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get op")
+				}
+				if bop != linux.NFT_BITWISE_BOOL {
+					return fmt.Errorf("unexpected op: %d, want %d", bop, linux.NFT_BITWISE_BOOL)
+				}
+
+				maskAttr, ok := attrs[linux.NFTA_BITWISE_MASK]
+				if !ok {
+					return fmt.Errorf("failed to get mask")
+				}
+				maskAttrs, ok := NfParse(nlmsg.AttrsView(maskAttr))
+				if !ok {
+					return fmt.Errorf("failed to parse mask")
+				}
+				maskValue, err := parseDataAttrs(maskAttrs)
+				if err != nil {
+					return fmt.Errorf("failed to parse mask data: %v", err)
+				}
+				if !bytes.Equal(maskValue, []byte{0xff}) {
+					return fmt.Errorf("unexpected mask value: %v, want %v", maskValue, []byte{0xff})
+				}
+
+				xorAttr, ok := attrs[linux.NFTA_BITWISE_XOR]
+				if !ok {
+					return fmt.Errorf("failed to get xor")
+				}
+				xorAttrs, ok := NfParse(nlmsg.AttrsView(xorAttr))
+				if !ok {
+					return fmt.Errorf("failed to parse xor")
+				}
+				xorValue, err := parseDataAttrs(xorAttrs)
+				if err != nil {
+					return fmt.Errorf("failed to parse xor data: %v", err)
+				}
+				if !bytes.Equal(xorValue, []byte{0x00}) {
+					return fmt.Errorf("unexpected xor value: %v, want %v", xorValue, []byte{0x00})
+				}
+
 				return nil
 			},
 		},
@@ -4538,6 +4600,51 @@ func TestDumpOperations(t *testing.T) {
 			},
 		},
 		{
+			name: "lookup",
+			op: &lookupOp{
+				set:      &nftSet{name: "map_set"},
+				sregIdx:  0,
+				invert:   true,
+				fillData: true,
+				dregIdx:  16,
+			},
+			validate: func(dump []byte) error {
+				attrs, ok := NfParse(dump)
+				if !ok {
+					return fmt.Errorf("failed to parse dumped attributes")
+				}
+				setName, ok := attrs[linux.NFTA_LOOKUP_SET]
+				if !ok {
+					return fmt.Errorf("failed to get set name")
+				}
+				if setName.String() != "map_set" {
+					return fmt.Errorf("unexpected set name: %q, want %q", setName.String(), "map_set")
+				}
+				sreg, ok := AttrNetToHost[uint32](linux.NFTA_LOOKUP_SREG, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get sreg")
+				}
+				if sreg != linux.NFT_REG_1 {
+					return fmt.Errorf("unexpected sreg: %d, want %d", sreg, linux.NFT_REG_1)
+				}
+				dreg, ok := AttrNetToHost[uint32](linux.NFTA_LOOKUP_DREG, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get dreg")
+				}
+				if dreg != linux.NFT_REG_2 {
+					return fmt.Errorf("unexpected dreg: %d, want %d", dreg, linux.NFT_REG_2)
+				}
+				flags, ok := AttrNetToHost[uint32](linux.NFTA_LOOKUP_FLAGS, attrs)
+				if !ok {
+					return fmt.Errorf("failed to get flags")
+				}
+				if flags != linux.NFT_LOOKUP_F_INV {
+					return fmt.Errorf("unexpected flags: %d, want %d", flags, linux.NFT_LOOKUP_F_INV)
+				}
+				return nil
+			},
+		},
+		{
 			name: "last",
 			op:   &last{},
 			validate: func(dump []byte) error {
@@ -4623,4 +4730,550 @@ func TestBaseChainEvalOrder(t *testing.T) {
 	validateOrder(t, stack.IP6, false /*wantNATChains*/, wantLen)
 	validateOrder(t, stack.IP, true /*wantNATChains*/, wantLen)
 	validateOrder(t, stack.IP, true /*wantNATChains*/, wantLen)
+}
+
+func TestDeepCopyIsolatesOperations(t *testing.T) {
+	tests := []struct {
+		name        string
+		op          operation
+		valuesEqual func(op1, op2 operation) bool
+	}{
+		{
+			name: "immediate",
+			op: &immediate{
+				data: []byte{1, 2, 3},
+			},
+			valuesEqual: func(op1, op2 operation) bool {
+				// Check that the pointers to the data are different.
+				if &op1.(*immediate).data[0] == &op2.(*immediate).data[0] {
+					return false
+				}
+				// Check that the data values are equal.
+				return slices.Equal(op1.(*immediate).data, op2.(*immediate).data)
+			},
+		},
+		{
+			name: "comparison",
+			op: &comparison{
+				data: []byte{1, 2, 3},
+			},
+			valuesEqual: func(op1, op2 operation) bool {
+				// Check that the pointers to the data are different.
+				if &op1.(*comparison).data[0] == &op2.(*comparison).data[0] {
+					return false
+				}
+				// Check that the data values are equal.
+				return slices.Equal(op1.(*comparison).data, op2.(*comparison).data)
+			},
+		},
+		{
+			name: "ranged",
+			op: &ranged{
+				low:  []byte{1, 2},
+				high: []byte{3, 4},
+			},
+
+			valuesEqual: func(op1, op2 operation) bool {
+				// Check that the pointers are different.
+				if &op1.(*ranged).low[0] == &op2.(*ranged).low[0] ||
+					&op1.(*ranged).high[0] == &op2.(*ranged).high[0] {
+					return false
+				}
+				// Check that the data values are equal.
+				return slices.Equal(op1.(*ranged).low, op2.(*ranged).low) &&
+					slices.Equal(op1.(*ranged).high, op2.(*ranged).high)
+			},
+		},
+		{
+			name: "bitwise",
+			op: &bitwise{
+				mask: []byte{1, 2},
+				xor:  []byte{3, 4},
+			},
+			valuesEqual: func(op1, op2 operation) bool {
+				if &op1.(*bitwise).mask[0] == &op2.(*bitwise).mask[0] ||
+					&op1.(*bitwise).xor[0] == &op2.(*bitwise).xor[0] {
+					return false
+				}
+				return slices.Equal(op1.(*bitwise).mask, op2.(*bitwise).mask) &&
+					slices.Equal(op1.(*bitwise).xor, op2.(*bitwise).xor)
+			},
+		},
+		{
+			name: "counter",
+			op:   newCounter(0, 0),
+			valuesEqual: func(op1, op2 operation) bool {
+				return op1.(*counter).packets.Load() == op2.(*counter).packets.Load()
+			},
+		},
+		{
+			name: "last",
+			op:   &last{},
+			valuesEqual: func(op1, op2 operation) bool {
+				return op1.(*last).timestampMS.Load() == op2.(*last).timestampMS.Load()
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nf := newNFTablesStd()
+			tab, err := nf.AddTable(stack.IP, "test_table", false)
+			if err != nil {
+				t.Fatalf("AddTable failed, err: %v", err)
+			}
+
+			bc, err := nf.AddChainToTable(tab, "test_chain", arbitraryInfoPolicyAccept, "test chain", false, 0, nil, linux.NF_ACCEPT)
+			if err != nil {
+				t.Fatalf("AddChainToTable failed, err: %v", err)
+			}
+
+			rule := &Rule{}
+			if err := rule.addOperation(test.op); err != nil {
+				t.Fatalf("addOperation failed, err: %v", err)
+			}
+			if err := bc.RegisterRule(rule, -1 /*=index*/); err != nil {
+				t.Fatalf("RegisterRule failed, err: %v", err)
+			}
+
+			nftCopy := nf.DeepCopy()
+			origTable := nf.filters[stack.IP].tables["test_table"]
+			origChain := origTable.chains["test_chain"]
+			origOp := origChain.rules[0].ops[0]
+
+			copyTable := nftCopy.filters[stack.IP].tables["test_table"]
+			copyChain := copyTable.chains["test_chain"]
+			copyOp := copyChain.rules[0].ops[0]
+
+			if origOp == copyOp {
+				t.Fatalf("wanted orig != copy, got %p == %p", origOp, copyOp)
+			}
+			if !test.valuesEqual(origOp, copyOp) {
+				t.Fatalf("wanted valuesEqual(orig, copy) == true, got false")
+			}
+		})
+	}
+}
+
+func TestGetSet(t *testing.T) {
+	tabName := "test_table"
+	setName := "test_set"
+
+	tests := []struct {
+		name         string
+		setAttrs     map[uint16]nlmsg.BytesView
+		getAttrs     map[uint16]nlmsg.BytesView
+		getFlags     uint16
+		expectGetErr *syserr.Error
+		verifyMsg    func(*testing.T, *nlmsg.MessageSet)
+	}{
+		{
+			name: "GetSet",
+			setAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_TABLE:     nlmsg.BytesView(tabName),
+				linux.NFTA_SET_NAME:      nlmsg.BytesView(setName),
+				linux.NFTA_SET_ID:        nlmsg.BytesView([]byte{0, 0, 0, 1}),
+				linux.NFTA_SET_KEY_LEN:   nlmsg.BytesView([]byte{0, 0, 0, 4}),
+				linux.NFTA_SET_FLAGS:     nlmsg.BytesView([]byte{0, 0, 0, 8}),
+				linux.NFTA_SET_DATA_TYPE: nlmsg.BytesView([]byte{0xff, 0xff, 0xff, 0x00}),
+			},
+			getAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_TABLE: nlmsg.BytesView(tabName),
+				linux.NFTA_SET_NAME:  nlmsg.BytesView(setName),
+			},
+			verifyMsg: func(t *testing.T, ms *nlmsg.MessageSet) {
+				if ms.Multi {
+					t.Errorf("Expected Multi to be false for non-DUMP GetSet")
+				}
+				if len(ms.Messages) != 1 {
+					t.Fatalf("Expected 1 message, got %d", len(ms.Messages))
+				}
+				attrs, ok := ms.Messages[0].GetData(&linux.NetFilterGenMsg{})
+				if !ok {
+					t.Fatalf("Failed to extract NetFilterGenMsg")
+				}
+				attrMap, ok := NfParse(attrs)
+				if !ok {
+					t.Fatalf("Failed to parse netlink attributes")
+				}
+				if string(attrMap[linux.NFTA_SET_TABLE][:len(tabName)]) != tabName {
+					t.Errorf("Unexpected table name: got %q, want %q", attrMap[linux.NFTA_SET_TABLE], tabName)
+				}
+				if string(attrMap[linux.NFTA_SET_NAME][:len(setName)]) != setName {
+					t.Errorf("Unexpected set name: got %q, want %q", attrMap[linux.NFTA_SET_NAME], setName)
+				}
+			},
+		},
+		{
+			name: "GetAllSets",
+			setAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_TABLE:     nlmsg.BytesView(tabName),
+				linux.NFTA_SET_NAME:      nlmsg.BytesView(setName),
+				linux.NFTA_SET_ID:        nlmsg.BytesView([]byte{0, 0, 0, 1}),
+				linux.NFTA_SET_KEY_LEN:   nlmsg.BytesView([]byte{0, 0, 0, 4}),
+				linux.NFTA_SET_FLAGS:     nlmsg.BytesView([]byte{0, 0, 0, 8}),
+				linux.NFTA_SET_DATA_TYPE: nlmsg.BytesView([]byte{0xff, 0xff, 0xff, 0x00}),
+			},
+			getAttrs: map[uint16]nlmsg.BytesView{},
+			getFlags: linux.NLM_F_DUMP,
+			verifyMsg: func(t *testing.T, ms *nlmsg.MessageSet) {
+				if !ms.Multi {
+					t.Errorf("Expected Multi to be true for DUMP GetSet")
+				}
+				if len(ms.Messages) != 1 {
+					t.Fatalf("Expected 1 message, got %d", len(ms.Messages))
+				}
+			},
+		},
+		{
+			name: "GetNonExistentSet",
+			setAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_TABLE:     nlmsg.BytesView(tabName),
+				linux.NFTA_SET_NAME:      nlmsg.BytesView(setName),
+				linux.NFTA_SET_ID:        nlmsg.BytesView([]byte{0, 0, 0, 1}),
+				linux.NFTA_SET_KEY_LEN:   nlmsg.BytesView([]byte{0, 0, 0, 4}),
+				linux.NFTA_SET_FLAGS:     nlmsg.BytesView([]byte{0, 0, 0, 8}),
+				linux.NFTA_SET_DATA_TYPE: nlmsg.BytesView([]byte{0xff, 0xff, 0xff, 0x00}),
+			},
+			getAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_TABLE: nlmsg.BytesView(tabName),
+				linux.NFTA_SET_NAME:  nlmsg.BytesView("BAD_SET"),
+			},
+			expectGetErr: syserr.ErrInvalidArgument,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nf := &NFTables{}
+			nf.filters[stack.Inet] = &addressFamilyFilter{
+				family: stack.Inet,
+				tables: make(map[string]*Table),
+			}
+
+			tab := &Table{
+				name:       tabName,
+				sets:       make(map[string]*nftSet),
+				setHandles: make(map[uint64]*nftSet),
+				afFilter:   nf.filters[stack.Inet],
+			}
+			nf.filters[stack.Inet].tables[tabName] = tab
+
+			if tc.setAttrs != nil {
+				ms := &nlmsg.MessageSet{Multi: false, PortID: 100}
+				if err := nf.NewSet(tc.setAttrs, stack.Inet, linux.NLM_F_CREATE, ms); err != nil {
+					t.Fatalf("NewSet failed: %v", err)
+				}
+			}
+
+			ms := &nlmsg.MessageSet{Multi: false, PortID: 100}
+			err := nf.GetSet(tc.getAttrs, stack.Inet, tc.getFlags, ms)
+			if tc.expectGetErr != nil {
+				if err == nil || err.GetError() != tc.expectGetErr {
+					t.Fatalf("Expected GetSet error %v, got %v", tc.expectGetErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetSet failed: %v", err)
+			}
+			if tc.verifyMsg != nil {
+				tc.verifyMsg(t, ms)
+			}
+		})
+	}
+}
+
+type wantSetElem struct {
+	key        []byte
+	userData   []byte
+	verdict    *stack.NFVerdict
+	isCatchAll bool
+}
+
+func parseDumpedElements(t *testing.T, ms *nlmsg.MessageSet) []wantSetElem {
+	var parsed []wantSetElem
+	for _, msg := range ms.Messages {
+		msgData, ok := msg.GetData(&linux.NetFilterGenMsg{})
+		if !ok {
+			continue
+		}
+		attrMap, ok := NfParse(msgData)
+		if !ok {
+			continue
+		}
+		elementsAttr, ok := attrMap[linux.NFTA_SET_ELEM_LIST_ELEMENTS]
+		if !ok {
+			continue
+		}
+
+		elementsView := nlmsg.AttrsView(elementsAttr)
+		for len(elementsView) > 0 {
+			hdrType, elem, rest, ok := elementsView.ParseFirst()
+			if !ok {
+				t.Fatalf("Failed to parse nested element in list")
+			}
+			elementsView = rest
+			if hdrType.Type != linux.NFTA_LIST_ELEM {
+				continue
+			}
+
+			elemMap, ok := NfParse(nlmsg.AttrsView(elem))
+			if !ok {
+				continue
+			}
+
+			var item wantSetElem
+			flagsAttr, flagsExists := elemMap[linux.NFTA_SET_ELEM_FLAGS]
+			if flagsExists {
+				flagVal := binary.BigEndian.Uint32([]byte(flagsAttr))
+				if uint16(flagVal)&linux.NFT_SET_ELEM_CATCHALL != 0 {
+					item.isCatchAll = true
+				}
+			}
+
+			if !item.isCatchAll {
+				keyAttr, ok := elemMap[linux.NFTA_SET_ELEM_KEY]
+				if ok {
+					keyMap, _ := NfParse(nlmsg.AttrsView(keyAttr))
+					keyData := keyMap[linux.NFTA_DATA_VALUE]
+					item.key = slices.Clone(keyData)
+				}
+			}
+
+			userDataAttr, userDataExists := elemMap[linux.NFTA_SET_ELEM_USERDATA]
+			if userDataExists {
+				item.userData = slices.Clone(userDataAttr)
+			}
+
+			dataAttr, dataExists := elemMap[linux.NFTA_SET_ELEM_DATA]
+			if dataExists {
+				dataMap, _ := NfParse(nlmsg.AttrsView(dataAttr))
+				verdictData, ok := dataMap[linux.NFTA_DATA_VERDICT]
+				if ok {
+					verdictMap, _ := NfParse(nlmsg.AttrsView(verdictData))
+					verdictCode, ok := AttrNetToHost[uint32](linux.NFTA_VERDICT_CODE, verdictMap)
+					if ok {
+						item.verdict = &stack.NFVerdict{Code: verdictCode}
+					}
+				}
+			}
+			parsed = append(parsed, item)
+		}
+	}
+	return parsed
+}
+
+func TestGetSetElements(t *testing.T) {
+	tabName := "test_table"
+	setName := "test_set"
+
+	key1 := []byte{192, 168, 1, 1}
+	keyData1, _ := dumpDataAttr(key1)
+	verdict1, _ := dumpVerdictDataAttr(stack.NFVerdict{Code: VC(linux.NF_ACCEPT)})
+
+	key2 := []byte{10, 0, 0, 1}
+	keyData2, _ := dumpDataAttr(key2)
+	verdict2, _ := dumpVerdictDataAttr(stack.NFVerdict{Code: VC(linux.NF_DROP)})
+	userData2 := []byte("my-element-userdata")
+
+	// Standard element 1
+	var qElem1 nlmsg.NestedAttr
+	qElem1.PutAttr(linux.NFTA_SET_ELEM_KEY, primitive.AsByteSlice(keyData1))
+	qElem1.PutAttr(linux.NFTA_SET_ELEM_DATA, primitive.AsByteSlice(verdict1))
+
+	// Userdata element 2
+	var qElem2 nlmsg.NestedAttr
+	qElem2.PutAttr(linux.NFTA_SET_ELEM_KEY, primitive.AsByteSlice(keyData2))
+	qElem2.PutAttr(linux.NFTA_SET_ELEM_DATA, primitive.AsByteSlice(verdict2))
+	qElem2.PutAttr(linux.NFTA_SET_ELEM_USERDATA, primitive.AsByteSlice(userData2))
+
+	// Catchall element 3
+	var qElem3 nlmsg.NestedAttr
+	qElem3.PutAttr(linux.NFTA_SET_ELEM_FLAGS, nlmsg.PutU32(uint32(linux.NFT_SET_ELEM_CATCHALL)))
+	qElem3.PutAttr(linux.NFTA_SET_ELEM_DATA, primitive.AsByteSlice(verdict1))
+
+	tests := []struct {
+		name             string
+		elemAttrs        map[uint16]nlmsg.BytesView // elements to create via NewSetElements
+		getAttrs         map[uint16]nlmsg.BytesView // elements to get via GetSetElements
+		getFlags         uint16
+		expectNewElemErr *syserr.Error
+		expectGetErr     *syserr.Error
+		wanted           []wantSetElem
+	}{
+		{
+			name:      "GetEmptyElements",
+			elemAttrs: nil,
+			getAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_ELEM_LIST_TABLE: nlmsg.BytesView(tabName),
+				linux.NFTA_SET_ELEM_LIST_SET:   nlmsg.BytesView(setName),
+			},
+			getFlags: linux.NLM_F_DUMP,
+			wanted:   nil,
+		},
+		{
+			name: "GetAllElements",
+			elemAttrs: func() map[uint16]nlmsg.BytesView {
+				var list nlmsg.NestedAttr
+				list.PutAttr(linux.NFTA_LIST_ELEM, primitive.AsByteSlice(qElem1))
+				list.PutAttr(linux.NFTA_LIST_ELEM, primitive.AsByteSlice(qElem2))
+				list.PutAttr(linux.NFTA_LIST_ELEM, primitive.AsByteSlice(qElem3))
+				return map[uint16]nlmsg.BytesView{
+					linux.NFTA_SET_ELEM_LIST_TABLE:    nlmsg.BytesView(tabName),
+					linux.NFTA_SET_ELEM_LIST_SET:      nlmsg.BytesView(setName),
+					linux.NFTA_SET_ELEM_LIST_ELEMENTS: nlmsg.BytesView(list),
+				}
+			}(),
+			getAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_ELEM_LIST_TABLE: nlmsg.BytesView(tabName),
+				linux.NFTA_SET_ELEM_LIST_SET:   nlmsg.BytesView(setName),
+			},
+			getFlags: linux.NLM_F_DUMP,
+			wanted: []wantSetElem{
+				{
+					key:     key1,
+					verdict: &stack.NFVerdict{Code: VC(linux.NF_ACCEPT)},
+				},
+				{
+					key:      key2,
+					userData: userData2,
+					verdict:  &stack.NFVerdict{Code: VC(linux.NF_DROP)},
+				},
+				{
+					isCatchAll: true,
+					verdict:    &stack.NFVerdict{Code: VC(linux.NF_ACCEPT)},
+				},
+			},
+		},
+		{
+			name: "GetElement",
+			elemAttrs: func() map[uint16]nlmsg.BytesView {
+				var list nlmsg.NestedAttr
+				list.PutAttr(linux.NFTA_LIST_ELEM, primitive.AsByteSlice(qElem2))
+				return map[uint16]nlmsg.BytesView{
+					linux.NFTA_SET_ELEM_LIST_TABLE:    nlmsg.BytesView(tabName),
+					linux.NFTA_SET_ELEM_LIST_SET:      nlmsg.BytesView(setName),
+					linux.NFTA_SET_ELEM_LIST_ELEMENTS: nlmsg.BytesView(list),
+				}
+			}(),
+			getAttrs: func() map[uint16]nlmsg.BytesView {
+				var queryElemAttr nlmsg.NestedAttr
+				queryKeyData, _ := dumpDataAttr(key2)
+				queryElemAttr.PutAttr(linux.NFTA_SET_ELEM_KEY, primitive.AsByteSlice(queryKeyData))
+
+				var queryListAttr nlmsg.NestedAttr
+				queryListAttr.PutAttr(linux.NFTA_LIST_ELEM, primitive.AsByteSlice(queryElemAttr))
+				return map[uint16]nlmsg.BytesView{
+					linux.NFTA_SET_ELEM_LIST_TABLE:    nlmsg.BytesView(tabName),
+					linux.NFTA_SET_ELEM_LIST_SET:      nlmsg.BytesView(setName),
+					linux.NFTA_SET_ELEM_LIST_ELEMENTS: nlmsg.BytesView(queryListAttr),
+				}
+			}(),
+			wanted: []wantSetElem{
+				{
+					key:      key2,
+					userData: userData2,
+					verdict:  &stack.NFVerdict{Code: VC(linux.NF_DROP)},
+				},
+			},
+		},
+		{
+			name: "GetElementsFromNonExistentSet",
+			getAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_ELEM_LIST_TABLE: nlmsg.BytesView(tabName),
+				linux.NFTA_SET_ELEM_LIST_SET:   nlmsg.BytesView("BAD_SET"),
+			},
+			getFlags:     linux.NLM_F_DUMP,
+			expectGetErr: syserr.ErrNoFileOrDir,
+		},
+		{
+			name: "GetNonExistentElement",
+			getAttrs: func() map[uint16]nlmsg.BytesView {
+				var queryElemAttr nlmsg.NestedAttr
+				queryKeyData, _ := dumpDataAttr([]byte{255, 255, 255, 255})
+				queryElemAttr.PutAttr(linux.NFTA_SET_ELEM_KEY, primitive.AsByteSlice(queryKeyData))
+
+				var queryListAttr nlmsg.NestedAttr
+				queryListAttr.PutAttr(linux.NFTA_LIST_ELEM, primitive.AsByteSlice(queryElemAttr))
+				return map[uint16]nlmsg.BytesView{
+					linux.NFTA_SET_ELEM_LIST_TABLE:    nlmsg.BytesView(tabName),
+					linux.NFTA_SET_ELEM_LIST_SET:      nlmsg.BytesView(setName),
+					linux.NFTA_SET_ELEM_LIST_ELEMENTS: nlmsg.BytesView(queryListAttr),
+				}
+			}(),
+			expectGetErr: syserr.ErrNoFileOrDir,
+		},
+		{
+			name: "GetElementsMissingElementsAttr",
+			getAttrs: map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_ELEM_LIST_TABLE: nlmsg.BytesView(tabName),
+				linux.NFTA_SET_ELEM_LIST_SET:   nlmsg.BytesView(setName),
+			},
+			expectGetErr: syserr.ErrInvalidArgument,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nf := &NFTables{}
+			nf.filters[stack.Inet] = &addressFamilyFilter{
+				family: stack.Inet,
+				tables: make(map[string]*Table),
+			}
+
+			tab := &Table{
+				name:       tabName,
+				sets:       make(map[string]*nftSet),
+				setHandles: make(map[uint64]*nftSet),
+				afFilter:   nf.filters[stack.Inet],
+			}
+			nf.filters[stack.Inet].tables[tabName] = tab
+
+			// Pre-create the set where elements will be added/queried
+			newSetAttrs := map[uint16]nlmsg.BytesView{
+				linux.NFTA_SET_TABLE:     nlmsg.BytesView(tabName),
+				linux.NFTA_SET_NAME:      nlmsg.BytesView(setName),
+				linux.NFTA_SET_ID:        nlmsg.BytesView([]byte{0, 0, 0, 1}),
+				linux.NFTA_SET_KEY_LEN:   nlmsg.BytesView([]byte{0, 0, 0, 4}),
+				linux.NFTA_SET_FLAGS:     nlmsg.BytesView([]byte{0, 0, 0, 8}),
+				linux.NFTA_SET_DATA_TYPE: nlmsg.BytesView([]byte{0xff, 0xff, 0xff, 0x00}),
+			}
+			if err := nf.NewSet(newSetAttrs, stack.Inet, linux.NLM_F_CREATE, &nlmsg.MessageSet{}); err != nil {
+				t.Fatalf("Setup NewSet failed: %v", err)
+			}
+
+			if tc.elemAttrs != nil {
+				ms := &nlmsg.MessageSet{Multi: false, PortID: 100}
+				err := nf.NewSetElements(tc.elemAttrs, stack.Inet, 0, ms)
+				if tc.expectNewElemErr != nil {
+					if err == nil || err.GetError() != tc.expectNewElemErr {
+						t.Fatalf("Expected NewSetElements error %v, got %v", tc.expectNewElemErr, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewSetElements failed: %v", err)
+				}
+			}
+
+			ms := &nlmsg.MessageSet{Multi: false, PortID: 100}
+			err := nf.GetSetElements(tc.getAttrs, stack.Inet, tc.getFlags, ms)
+			if tc.expectGetErr != nil {
+				if err == nil || err.GetError() != tc.expectGetErr {
+					t.Fatalf("Expected GetSetElements error %v, got %v", tc.expectGetErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetSetElements failed: %v", err)
+			}
+
+			// Validate returned elements against expected elements list
+			parsed := parseDumpedElements(t, ms)
+			if diff := cmp.Diff(tc.wanted, parsed, cmp.AllowUnexported(wantSetElem{})); diff != "" {
+				t.Errorf("GetSetElements returned unexpected elements diff (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

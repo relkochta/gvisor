@@ -1,5 +1,6 @@
 load("//images:defs.bzl", "docker_image")
 load("//tools:defs.bzl", "bzl_library", "pkg_tar")
+load("//tools/yamltest:defs.bzl", "yaml_test")
 load("//website:defs.bzl", "doc", "docs")
 
 package(
@@ -114,9 +115,12 @@ pkg_tar(
     srcs = [
         "_config.yml",
         ":css",
+        "//website/application_compatibility:index.html",
         "//website/blog:index.html",
+        "//website/security_track_record:index.html",
         "//website/users:index.html",
     ] + glob([
+        "_data/**",
         "assets/**",
         "_includes/**",
         "_layouts/**",
@@ -160,6 +164,7 @@ docs(
         "//g3doc/user_guide:debugging",
         "//g3doc/user_guide:filesystem",
         "//g3doc/user_guide:fs_snapshot",
+        "//g3doc/user_guide:fuse",
         "//g3doc/user_guide:gpu",
         "//g3doc/user_guide:install",
         "//g3doc/user_guide:networking",
@@ -177,6 +182,8 @@ docs(
         "//g3doc/user_guide/quick_start:docker",
         "//g3doc/user_guide/quick_start:kubernetes",
         "//g3doc/user_guide/quick_start:oci",
+        "//g3doc/user_guide/sdk:go",
+        "//g3doc/user_guide/sdk:quickstart",
         "//g3doc/user_guide/tutorials:cni",
         "//g3doc/user_guide/tutorials:docker",
         "//g3doc/user_guide/tutorials:docker_compose",
@@ -212,4 +219,17 @@ bzl_library(
     name = "defs_bzl",
     srcs = ["defs.bzl"],
     visibility = ["//visibility:private"],
+)
+
+yaml_test(
+    name = "cve_track_record_test",
+    srcs = ["_data/cve-track-record.yml"],
+    disallow_comments = True,
+    schema = "//website:cve-track-record.schema.json",
+)
+
+yaml_test(
+    name = "application_compatibility_test",
+    srcs = ["_data/application-compatibility.yml"],
+    schema = "//website:application-compatibility.schema.json",
 )

@@ -15,6 +15,8 @@
 package nftables
 
 import (
+	"slices"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
@@ -31,7 +33,7 @@ type immediate struct {
 }
 
 // evaluate for immediate sets the data in the destination register.
-func (op immediate) evaluate(regs *registerSet, pkt *stack.PacketBuffer, rule *Rule) {
+func (op immediate) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 	switch op.dataType {
 	case linux.NFT_DATA_VALUE:
 		copy(regs.data[op.dregIdx:], op.data)
@@ -48,18 +50,18 @@ func (op immediate) Dump() ([]byte, *syserr.AnnotatedError) {
 	m := &nlmsg.Message{}
 	var regDump []byte
 	var err *syserr.AnnotatedError
-	reg := uint32(0)
+	reg := nlmsg.PutU32(0)
 	switch op.dataType {
 	case linux.NFT_DATA_VERDICT:
 		regDump, err = dumpVerdictDataAttr(op.verdict)
 	case linux.NFT_DATA_VALUE:
-		reg = uint32(formatRegIdxForDump(op.dregIdx))
+		reg = formatRegIdxForDump(op.dregIdx)
 		regDump, err = dumpDataAttr(op.data)
 	}
 	if err != nil {
 		return nil, err
 	}
-	m.PutAttr(linux.NFTA_IMMEDIATE_DREG, nlmsg.PutU32(reg))
+	m.PutAttr(linux.NFTA_IMMEDIATE_DREG, reg)
 	m.PutAttr(linux.NFTA_IMMEDIATE_DATA, primitive.AsByteSlice(regDump))
 	return m.Buffer(), nil
 }
@@ -114,6 +116,17 @@ func initImmediate(tab *Table, exprInfo ExprInfo) (*immediate, *syserr.Annotated
 		return nil, err
 	}
 	return newImmediate(uint8(reg), regType, data, stack.NFVerdict{})
+}
+
+func (op *immediate) deepCopy() operation {
+	opCopy := *op
+	opCopy.data = slices.Clone(op.data)
+	return &opCopy
+}
+
+// checkCompatibility implements operation.checkCompatibility.
+func (op immediate) checkCompatibility(cCtx *opCompatCtx) *syserr.AnnotatedError {
+	return nil
 }
 
 // immRegToType returns the corresponding data type for a given register number.

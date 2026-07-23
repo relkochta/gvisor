@@ -61,6 +61,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/interrupt"
@@ -271,7 +272,7 @@ func (*Systrap) MinUserAddress() hostarch.Addr {
 
 // New returns a new seccomp-based implementation of the platform interface.
 func New(opts platform.Options) (*Systrap, error) {
-
+	mbCh := hostmm.Probe(false)
 	if !disableSyscallPatching {
 		disableSyscallPatching = opts.DisableSyscallPatching
 	}
@@ -295,8 +296,14 @@ func New(opts platform.Options) (*Systrap, error) {
 		// Configure address space parameters for the current host's
 		// VA width. Must be called before any Context64 is created.
 		configureSystrapAddressSpace()
-		// Don't use sentry and stub fast paths if here is just one cpu.
-		neverEnableFastPath = min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
+		// Don't use sentry and stub fast paths if here is just one cpu,
+		// or if the fast path has been explicitly disabled.
+		neverEnableFastPath = opts.DisableFastPath || min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
+
+		// Convert the spin/deep-sleep timeouts into cputicks() units for
+		// the current architecture. Must happen before stubInit(), which
+		// copies deepSleepTimeout into the stub.
+		initSleepTimeouts()
 
 		// Initialize the stub.
 		stubInit()
@@ -322,11 +329,16 @@ func New(opts platform.Options) (*Systrap, error) {
 		return nil, stubErr
 	}
 
-	latencyMonitoring.Do(func() {
-		go controlFastPath()
-	})
+	if !neverEnableFastPath {
+		latencyMonitoring.Do(func() {
+			go controlFastPath()
+		})
+	}
 
-	return &Systrap{memoryFile: mf}, nil
+	return &Systrap{
+		UseHostGlobalMemoryBarrier: platform.UseHostGlobalMemoryBarrier{MemBarrier: <-mbCh},
+		memoryFile:                 mf,
+	}, nil
 }
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.

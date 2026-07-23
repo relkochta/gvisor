@@ -47,6 +47,7 @@ const (
 	flagQDisc                   = "qdisc"
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
+	flagMountCgroupV2           = "mount-cgroup-v2"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -116,8 +117,11 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("enable-core-tags", false, "enables core tagging. Requires host linux kernel >= 5.14.")
 	flagSet.String("pod-init-config", "", "path to configuration file with additional steps to take during pod creation.")
 	flagSet.Var(HostSettingsCheck.Ptr(), "host-settings", "how to handle non-optimal host kernel settings: check (default, advisory-only), ignore (do not check), adjust (best-effort auto-adjustment), or enforce (auto-adjustment must succeed).")
+	// TODO(gvisor.dev/issue/13718): flip default to `IF_RELEASE_BUILD`.
+	flagSet.Var(SidecarNever.Ptr(), "sidecar-release-enforcement-policy", "when spawned sidecar binaries must match runsc's release: NEVER, ALWAYS, or IF_RELEASE_BUILD. May be overridden by setting GVISOR_ENFORCE_RELEASE=SKIP as env var.")
 	flagSet.Var(RestoreSpecValidationEnforce.Ptr(), "restore-spec-validation", "how to handle spec validation during restore.")
 	flagSet.Bool("systrap-disable-syscall-patching", false, "disables syscall patching when using the Systrap platform. May be necessary to use in case the workload uses the GS register, or uses ptrace within gVisor. Has significant performance implications and is only recommended when the sandbox is known to run otherwise-incompatible workloads. Only relevant for x86.")
+	flagSet.Bool("systrap-disable-fast-path", false, "unconditionally disables the Systrap fast path.")
 	flagSet.Bool("allow-suid", false, "allows ID elevation when executing binaries with the SUID/SGID bits set. The OCI --no-new-privileges flag continues to prevent ID elevation even when this flag is true.")
 	flagSet.Bool("kvm-use-cpu-nums", false, "on KVM use vCPU numbers as CPU numbers in the sentry. This is necessary to support features like rseq.")
 	flagSet.Bool("allow-rootfs-tar-annotation", false, "allows the rootfs tar annotation to be set.")
@@ -142,6 +146,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("override-procs", "", "comma-separated list of proc files to override with stubs (e.g. kallsyms)")
 
 	flagSet.Bool("ignore-cgroups", false, "don't configure cgroups.")
+	flagSet.Bool(flagMountCgroupV2, false, "EXPERIMENTAL. Mount cgroup v2 instead of cgroup v1 inside the sandbox. cgroup v2 support in gVisor is experimental and incomplete. Do not use for production workloads.")
 	flagSet.Int("fdlimit", -1, "Specifies a limit on the number of host file descriptors that can be open. Applies separately to the sentry and gofer. Note: each file in the sandbox holds more than one host FD open.")
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
 	flagSet.Bool("iouring", false, "TEST ONLY; Enables io_uring syscalls in the sentry. Support is experimental and very limited.")
@@ -175,6 +180,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("nvproxy", false, "LEGACY: enable support for Nvidia GPUs. GPU support gets automatically enabled if Nvidia devices are present in the OCI spec.")
 	flagSet.Bool("nvproxy-docker", false, "LEGACY: Injects nvidia-container-runtime-hook as a prestart hook. Try to use nvidia-container-runtime or `docker run --gpus` instead. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
+	flagSet.Bool("nvproxy-allow-unsupported-driver", false, "allow nvproxy to be initialized with an unsupported driver version.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
 
@@ -211,6 +217,7 @@ var overrideAllowlist = map[string]struct {
 	flagQDisc:                   {check: checkQDisc},
 	flagQDiscTBFRate:            {check: checkQDiscTBFRate},
 	flagQDiscTBFBurst:           {check: checkQDiscTBFBurst},
+	flagMountCgroupV2:           {},
 }
 
 // checkOverlay2 ensures that overlay2 can only be enabled using "memory" or
@@ -330,43 +337,8 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 		}
 	}
 
-	if err := conf.validate(); err != nil {
+	if err := conf.Validate(); err != nil {
 		return nil, err
-	}
-	return conf, nil
-}
-
-// NewFromBundle makes a new config from a Bundle.
-func NewFromBundle(bundle Bundle) (*Config, error) {
-	if err := bundle.Validate(); err != nil {
-		return nil, err
-	}
-	flagSet := flag.NewFlagSet("tmp", flag.ContinueOnError)
-	RegisterFlags(flagSet)
-	conf := &Config{explicitlySet: map[string]struct{}{}}
-
-	obj := reflect.ValueOf(conf).Elem()
-	st := obj.Type()
-	for i := 0; i < st.NumField(); i++ {
-		f := st.Field(i)
-		name, ok := f.Tag.Lookup("flag")
-		if !ok {
-			continue
-		}
-		fl := flagSet.Lookup(name)
-		if fl == nil {
-			return nil, fmt.Errorf("flag %q not found", name)
-		}
-		val, ok := bundle[name]
-		if !ok {
-			continue
-		}
-		if err := flagSet.Set(name, val); err != nil {
-			return nil, fmt.Errorf("error setting flag %s=%q: %w", name, val, err)
-		}
-		conf.Override(flagSet, name, val, true)
-
-		conf.explicitlySet[name] = struct{}{}
 	}
 	return conf, nil
 }
@@ -420,7 +392,11 @@ func (c *Config) keyVals(flagSet *flag.FlagSet, onlyIfSet bool) map[string]strin
 	return keyVals
 }
 
-// Override writes a new value to a flag.
+// Override writes a new value to a flag. It does not validate the resulting
+// Config, so flags that are invalid in isolation but valid together (e.g.
+// qdisc=tbf and qdisc-tbf-rate) can be overridden in any order. Callers must
+// call Validate once they are done overriding to ensure the Config is left in
+// a consistent state.
 func (c *Config) Override(flagSet *flag.FlagSet, name string, value string, force bool) error {
 	obj := reflect.ValueOf(c).Elem()
 	st := obj.Type()
@@ -449,9 +425,7 @@ func (c *Config) Override(flagSet *flag.FlagSet, name string, value string, forc
 		}
 		x := reflect.ValueOf(flag.Get(fl.Value))
 		obj.Field(i).Set(x)
-
-		// Validates the config again to ensure it's left in a consistent state.
-		return c.validate()
+		return nil
 	}
 	return fmt.Errorf("flag %q not found. Cannot set it to %q", name, value)
 }
@@ -541,7 +515,7 @@ func (c *Config) ApplyBundles(flagSet *flag.FlagSet, bundleNames ...BundleName) 
 		}
 	}
 
-	return c.validate()
+	return c.Validate()
 }
 
 func getVal(field reflect.Value) string {

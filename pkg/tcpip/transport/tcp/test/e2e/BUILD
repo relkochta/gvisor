@@ -9,6 +9,7 @@ go_test(
     name = "tcp_test",
     size = "large",
     srcs = [
+        "mark_test.go",
         "tcp_migration_test.go",
         "tcp_test.go",
     ],
@@ -145,6 +146,22 @@ go_test(
         "//pkg/tcpip/transport/tcp",
         "//pkg/tcpip/transport/tcp/testing/context",
         "//pkg/test/testutil",
+    ],
+)
+
+go_test(
+    name = "tcp_acktiming_test",
+    size = "small",
+    srcs = ["tcp_acktiming_test.go"],
+    deps = [
+        ":e2e",
+        "//pkg/refs",
+        "//pkg/tcpip",
+        "//pkg/tcpip/faketime",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/seqnum",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/tcp/testing/context",
     ],
 )
 

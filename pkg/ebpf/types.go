@@ -1,0 +1,57 @@
+package ebpf
+
+import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
+)
+
+type CgroupBpfAttachType uint
+
+// Subset of attachment types that are valid for cgroup eBPF programs.
+const (
+	CGROUP_INET_INGRESS CgroupBpfAttachType = iota
+	CGROUP_INET_EGRESS
+	CGROUP_INET_SOCK_CREATE
+	CGROUP_SOCK_OPS
+	CGROUP_DEVICE
+	CGROUP_INET4_BIND
+	CGROUP_INET6_BIND
+	CGROUP_INET4_CONNECT
+	CGROUP_INET6_CONNECT
+	CGROUP_UNIX_CONNECT
+	CGROUP_INET4_POST_BIND
+	CGROUP_INET6_POST_BIND
+	CGROUP_UDP4_SENDMSG
+	CGROUP_UDP6_SENDMSG
+	CGROUP_UNIX_SENDMSG
+	CGROUP_SYSCTL
+	CGROUP_UDP4_RECVMSG
+	CGROUP_UDP6_RECVMSG
+	CGROUP_UNIX_RECVMSG
+	CGROUP_GETSOCKOPT
+	CGROUP_SETSOCKOPT
+	CGROUP_INET4_GETPEERNAME
+	CGROUP_INET6_GETPEERNAME
+	CGROUP_UNIX_GETPEERNAME
+	CGROUP_INET4_GETSOCKNAME
+	CGROUP_INET6_GETSOCKNAME
+	CGROUP_UNIX_GETSOCKNAME
+	CGROUP_INET_SOCK_RELEASE
+	MAX_CGROUP_BPF_ATTACH_TYPE
+)
+
+type BpfAttachType interface {
+	isBpfAttachType()
+}
+
+func (c CgroupBpfAttachType) isBpfAttachType() {}
+
+// TODO: finish this scaffolding
+
+func ParseAttachmentType(b linux.BpfAttachType) BpfAttachType {
+	switch b {
+	case linux.BPF_CGROUP_DEVICE:
+		return CGROUP_DEVICE
+	}
+
+	return nil
+}

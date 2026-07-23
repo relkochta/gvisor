@@ -223,7 +223,7 @@ steps:
       <<: *retry_settings
     commands:
       - make sudo TARGETS=//tools/gpu:main ARGS="install --latest"
-      - make cuda-tests
+      - make cuda-12-8-tests
     agents:
       queue: gpu
   - <<: *common
@@ -243,6 +243,16 @@ steps:
       - make BAZEL_OPTIONS=--config=x86_64 artifacts/x86_64
       - make BAZEL_OPTIONS=--config=aarch64 artifacts/aarch64
       - make release
+    agents:
+      arch: "amd64"
+
+  # Verify STAGED_BINARIES contents match the release tarball fileset.
+  # Runs only when `STAGED_BINARIES` is set (so cannot use `*source_test`).
+  - <<: *common
+    label: ":package: Staged binaries consistency check"
+    if: build.env("STAGED_BINARIES") != null
+    commands:
+      - make staged-binaries-check
     agents:
       arch: "amd64"
 
@@ -310,12 +320,13 @@ steps:
   # All system call tests.
   - <<: *common
     label: ":toolbox: System call tests (AMD64)"
-    command: make BAZEL_OPTIONS=--test_tag_filters=-allsave syscall-tests
+    command: make BAZEL_OPTIONS=--test_tag_filters=-allsave,-runsc_slimvm syscall-tests
     parallelism: 20
     agents:
       <<: *platform_specific_agents
       <<: *kvm_agents
       arch: "amd64"
+      kernel: "modern"
   - <<: *common
     <<: *source_test
     label: ":muscle: System call tests (ARM64)"
@@ -331,6 +342,7 @@ steps:
     parallelism: 20
     agents:
       arch: "amd64"
+      kernel: "modern"
   # With Save Resume on ARM64.
   - <<: *common
     <<: *source_test_continuous
@@ -370,6 +382,15 @@ steps:
     agents:
       <<: *ubuntu_agents
       arch: "amd64"
+      cgroup: "v2"
+  - <<: *common
+    <<: *docker
+    <<: *source_test
+    label: ":docker: Docker tests (ARM64)"
+    command: make docker-tests
+    agents:
+      <<: *ubuntu_agents
+      arch: "arm64"
       cgroup: "v2"
   - <<: *common
     <<: *docker
@@ -478,7 +499,7 @@ steps:
     command: make containerd-test-2.2.3
     agents:
       <<: *ubuntu_agents
-      <<: *containerd_agents      
+      <<: *containerd_agents
   - <<: *common
     <<: *source_test
     label: ":podman: Podman"
@@ -536,20 +557,6 @@ steps:
       # This test is flaky on old agents.
       cgroup: "v2"
       kernel: "modern"
-  - <<: *common
-    <<: *source_test
-    label: ":golang: runsc go binding tests (amd64)"
-    command: make go-binding-test
-    agents:
-      cgroup: "v2"
-      arch: "amd64"
-  - <<: *common
-    <<: *source_test
-    label: ":golang: runsc go binding tests (arm64)"
-    command: make go-binding-test
-    agents:
-      cgroup: "v2"
-      arch: "arm64"
   # Runtime tests.
   - <<: *common
     <<: *docker
@@ -567,6 +574,7 @@ steps:
     agents:
       <<: *platform_specific_agents
       arch: "amd64"
+      kernel: "modern"
   - <<: *common
     <<: *docker
     label: ":golang: Go runtime tests"
@@ -583,6 +591,7 @@ steps:
     agents:
       <<: *platform_specific_agents
       arch: "amd64"
+      kernel: "modern"
   - <<: *common
     <<: *docker
     label: ":python: Python runtime tests"
@@ -591,6 +600,22 @@ steps:
     agents:
       <<: *platform_specific_agents
       arch: "amd64"
+
+  # Bwrap tests.
+  - <<: *common
+    <<: *docker
+    <<: *source_test
+    label: ":package: bwrap tests (AMD64)"
+    command: make bwrap-tests
+    agents:
+      arch: "amd64"
+  - <<: *common
+    <<: *docker
+    <<: *source_test
+    label: ":package: bwrap tests (ARM64)"
+    command: make bwrap-tests
+    agents:
+      arch: "arm64"
 
   # Runtime tests (goferfs). Continuous only.
   - <<: *common
